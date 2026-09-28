@@ -156,6 +156,25 @@ def route_metrics(origin, destination, key):
 def normalize_clients(df):
     df = df.copy()
 
+    # Accept a few human-friendly column names so the app is less fragile
+    # if a CSV was edited on a phone or exported from another system.
+    aliases = {
+        "Duration Minutes": "Minutes",
+        "Duration": "Minutes",
+        "Appointment Minutes": "Minutes",
+        "Frequency": "Frequency Weeks",
+        "Last Groom Date": "Last Groom",
+        "Client Name": "Client",
+        "Pet Names": "Pets",
+        "Phone Number": "Phone",
+        "Zip": "ZIP",
+        "Zip Code": "ZIP",
+    }
+
+    for source, target in aliases.items():
+        if source in df.columns and target not in df.columns:
+            df[target] = df[source]
+
     for c in CLIENT_COLUMNS:
         if c not in df.columns:
             df[c] = None
@@ -373,11 +392,12 @@ def score_candidates(
             score -= 100
 
         if area != "Any":
-            if str(row["Area"]).lower() == area.lower():
+            if str(row["Area"]).strip().lower() == area.strip().lower():
                 score += 35
                 reasons.append("same area")
             else:
                 score -= 15
+                reasons.append("different area")
 
         if pd.notna(row["Minutes"]) and row["Minutes"] <= available_minutes:
             score += 20
@@ -619,9 +639,12 @@ with planner_tab:
         target_time,
     )
 
+    # Primary pool: assigned groomer, fits the opening, due within 3 weeks.
     candidates = due_clients[
         (due_clients["Groomer"] == selected_groomer)
+        & (due_clients["Minutes"].notna())
         & (due_clients["Minutes"] <= available_minutes)
+        & (due_clients["Days Until Due"].notna())
         & (due_clients["Days Until Due"] <= 21)
     ].copy()
 
@@ -637,11 +660,71 @@ with planner_tab:
         maps_key,
     )
 
+    fallback_note = None
+
+    # If no exact-ish match exists, relax the due-date rule first.
+    if ranked.empty:
+        relaxed = due_clients[
+            (due_clients["Groomer"] == selected_groomer)
+            & (due_clients["Minutes"].notna())
+            & (due_clients["Minutes"] <= available_minutes)
+        ].copy()
+
+        ranked = score_candidates(
+            relaxed,
+            target_date,
+            selected_groomer,
+            selected_area,
+            available_minutes,
+            before_client,
+            after_client,
+            due_clients,
+            maps_key,
+        )
+
+        if not ranked.empty:
+            fallback_note = (
+                "No clients fit the due-within-3-weeks rule, so these are the "
+                "best schedule-fit alternatives."
+            )
+
+    # If still empty, allow slightly-too-long appointments as alternatives.
+    if ranked.empty:
+        relaxed_more = due_clients[
+            (due_clients["Groomer"] == selected_groomer)
+            & (due_clients["Minutes"].notna())
+            & (due_clients["Minutes"] <= available_minutes + 30)
+        ].copy()
+
+        ranked = score_candidates(
+            relaxed_more,
+            target_date,
+            selected_groomer,
+            selected_area,
+            available_minutes + 30,
+            before_client,
+            after_client,
+            due_clients,
+            maps_key,
+        )
+
+        if not ranked.empty:
+            fallback_note = (
+                "No exact duration match was available, so these include "
+                "appointments up to 30 minutes longer."
+            )
+
     st.markdown("### Best clients to contact")
 
     if ranked.empty:
-        st.info("No clients match this opening.")
+        st.info(
+            "No suggestions yet. Check that your client CSV has values for "
+            "Groomer, Minutes, Last Groom, and Frequency Weeks."
+        )
     else:
+        if fallback_note:
+            st.caption(fallback_note)
+
         top = ranked.head(10).copy()
 
         display = top[
@@ -1016,4 +1099,3 @@ with export_tab:
 st.caption(
     "v5 prototype: private runtime client data + client manager + due list + planner. "
     "A later version can add a persistent private database so edits save automatically."
-)
