@@ -637,6 +637,7 @@ def assign_times_to_weekly_plan(
     return plan
 
 def render_weekly_cards(valid_plan, daily_capacity, travel_buffer):
+    """Compact week-at-a-glance view designed for phones."""
     if valid_plan.empty:
         st.info("No scheduled appointments for this week.")
         return
@@ -646,28 +647,31 @@ def render_weekly_cards(valid_plan, daily_capacity, travel_buffer):
         ascending=[True, True, True, True],
     ).copy()
 
+    st.markdown("## Week at a glance")
+
+    # Show every scheduled day together in one continuous compact view.
     for (day_date, day_name), day_group in sorted_plan.groupby(
         ["Date", "Day"],
         sort=True,
     ):
-        st.markdown(f"## {day_name} · {pd.Timestamp(day_date):%b %d}")
+        day_revenue = float(day_group["Price"].fillna(0).sum())
+        day_minutes = int(day_group["Minutes"].fillna(0).sum())
+        day_appts = len(day_group)
+
+        st.markdown(
+            f"### {day_name} · {pd.Timestamp(day_date):%b %d}"
+            f"  \n{day_appts} appts · {day_minutes} groom min · ${day_revenue:,.0f}"
+        )
 
         for groomer, groomer_group in day_group.groupby("Groomer", sort=False):
             area = ""
             if groomer_group["Area Cluster"].notna().any():
                 area = str(groomer_group["Area Cluster"].dropna().iloc[0])
 
-            appt_count = len(groomer_group)
-            total_minutes = int(groomer_group["Minutes"].fillna(0).sum())
-            total_revenue = float(groomer_group["Price"].fillna(0).sum())
-            travel_total = max(appt_count - 1, 0) * int(travel_buffer)
-            open_minutes = max(
-                int(daily_capacity) - total_minutes - travel_total,
-                0,
-            )
-
             st.markdown(
-                f"### {groomer}" + (f" · {area}" if area else "")
+                f"**{groomer}"
+                + (f" · {area}" if area else "")
+                + "**"
             )
 
             for _, row in groomer_group.iterrows():
@@ -682,183 +686,31 @@ def render_weekly_cards(valid_plan, daily_capacity, travel_buffer):
                 if not owner:
                     continue
 
-                dog_text = f" · {dogs}" if dogs else ""
-
+                dog_text = f" / {dogs}" if dogs else ""
                 st.markdown(
-                    f"**{start_time}–{end_time}**  \n"
-                    f"**{owner}{dog_text}**  \n"
-                    f"{status} · {minutes} min · ${price:,.0f}"
-                )
-                st.divider()
-
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Appts", appt_count)
-            c2.metric("Groom min", total_minutes)
-            c3.metric("Revenue", f"${total_revenue:,.0f}")
-            c4.metric("Open min", open_minutes)
-
-            if travel_buffer:
-                st.caption(
-                    f"Estimated travel/setup buffer: {travel_buffer} min between households. "
-                    "Actual drive time will replace this when Maps routing is connected."
+                    f"- **{start_time}–{end_time}** · **{owner}{dog_text}** "
+                    f"· {minutes} min · ${price:,.0f} · {status}"
                 )
 
-def schedule_score(row):
-    score = 0
-    days = row.get("Days Until Due")
-
-    if pd.notna(days):
-        if days < 0:
-            score += 80 + min(abs(int(days)), 30)
-        elif days <= 7:
-            score += 50
-        elif days <= 14:
-            score += 30
-        elif days <= 21:
-            score += 15
-        else:
-            score -= 20
-
-    price = row.get("Price")
-    if pd.notna(price):
-        score += min(int(float(price) / 20), 12)
-
-    return score
-
-def choose_area_for_day(pool):
-    if pool.empty:
-        return None
-
-    area_summary = (
-        pool.groupby("Area", dropna=False)
-        .agg(
-            Clients=("Owner", "count"),
-            Overdue=("Days Until Due", lambda s: int((s < 0).sum())),
-            DueSoon=("Days Until Due", lambda s: int((s <= 7).sum())),
-            Revenue=("Price", "sum"),
-        )
-        .reset_index()
-    )
-
-    area_summary["Area Score"] = (
-        area_summary["Overdue"] * 100
-        + area_summary["DueSoon"] * 40
-        + area_summary["Clients"] * 15
-        + area_summary["Revenue"].fillna(0) / 10
-    )
-
-    area_summary = area_summary.sort_values(
-        ["Area Score", "Overdue", "DueSoon", "Revenue"],
-        ascending=[False, False, False, False],
-    )
-
-    return area_summary.iloc[0]["Area"]
-
-def build_week_plan(
-    clients_df,
-    week_start,
-    daily_capacity_minutes=420,
-    max_appointments_per_day=4,
-):
-    due = household_due_table(clients_df, week_start)
-    due = due[due["Days Until Due"].notna()].copy()
-
-    # Automatic weekly planning considers overdue clients and clients due
-    # within the next three weeks.
-    pool = due[due["Days Until Due"] <= 21].copy()
-    pool["Weekly Score"] = pool.apply(schedule_score, axis=1)
-
-    days = week_dates(pd.Timestamp(week_start))
-    scheduled_households = set()
-    results = []
-
-    for day_ts in days:
-        day_date = day_ts.date()
-        day_name = day_ts.strftime("%A")
-
-        for groomer, allowed_days in WORKDAYS.items():
-            if day_name not in allowed_days:
-                continue
-
-            groomer_pool = pool[
-                (pool["Groomer"] == groomer)
-                & (~pool["Owner"].isin(scheduled_households))
-                & (pool["Minutes"].notna())
-            ].copy()
-
-            if groomer_pool.empty:
-                results.append({
-                    "Date": day_date,
-                    "Day": day_name,
-                    "Groomer": groomer,
-                    "Area Cluster": "",
-                    "Owner": "",
-                    "Dogs": "",
-                    "Status": "",
-                    "Minutes": 0,
-                    "Price": 0,
-                    "Score": 0,
-                })
-                continue
-
-            # ONE primary area per groomer/day.
-            preferred_area = choose_area_for_day(groomer_pool)
-
-            area_pool = groomer_pool[
-                groomer_pool["Area"].astype(str).str.strip().str.lower()
-                == str(preferred_area).strip().lower()
-            ].copy()
-
-            area_pool = area_pool.sort_values(
-                ["Weekly Score", "Days Until Due", "Price"],
-                ascending=[False, True, False],
+            used_minutes = int(groomer_group["Minutes"].fillna(0).sum())
+            appt_count = len(groomer_group)
+            travel_total = max(appt_count - 1, 0) * int(travel_buffer)
+            open_minutes = max(
+                int(daily_capacity) - used_minutes - travel_total,
+                0,
             )
 
-            used = 0
-            selected = []
+            st.caption(
+                f"{groomer}: {open_minutes} open min remaining "
+                f"(using {travel_buffer}-min estimated travel/setup buffers)"
+            )
 
-            for _, row in area_pool.iterrows():
-                mins = int(row["Minutes"]) if pd.notna(row["Minutes"]) else 0
-                if mins <= 0:
-                    continue
-                if len(selected) >= max_appointments_per_day:
-                    break
-                if used + mins > daily_capacity_minutes:
-                    continue
+        st.divider()
 
-                selected.append(row)
-                used += mins
-                scheduled_households.add(row["Owner"])
-
-            if not selected:
-                results.append({
-                    "Date": day_date,
-                    "Day": day_name,
-                    "Groomer": groomer,
-                    "Area Cluster": preferred_area or "",
-                    "Owner": "",
-                    "Dogs": "",
-                    "Status": "",
-                    "Minutes": 0,
-                    "Price": 0,
-                    "Score": 0,
-                })
-            else:
-                for row in selected:
-                    results.append({
-                        "Date": day_date,
-                        "Day": day_name,
-                        "Groomer": groomer,
-                        "Area Cluster": preferred_area or row["Area"],
-                        "Owner": row["Owner"],
-                        "Dogs": row["Dogs"],
-                        "Status": row["Status"],
-                        "Minutes": int(row["Minutes"]) if pd.notna(row["Minutes"]) else 0,
-                        "Price": float(row["Price"]) if pd.notna(row["Price"]) else 0,
-                        "Score": int(row["Weekly Score"]),
-                    })
-
-    return pd.DataFrame(results)
+    st.caption(
+        "All five workdays stay on one page. Travel/setup time is still an estimate "
+        "until real map routing is connected."
+    )
 
 
 # ---------- Session data ----------
@@ -1348,7 +1200,7 @@ with weekly_tab:
         m2.metric("Projected revenue", f"${valid['Price'].sum():,.0f}")
         m3.metric("Scheduled minutes", int(valid["Minutes"].sum()))
 
-        st.markdown("### Weekly schedule")
+        st.markdown("### Whole-week schedule")
         render_weekly_cards(
             valid,
             daily_capacity=daily_capacity,
