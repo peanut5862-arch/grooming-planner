@@ -10,12 +10,12 @@ import pandas as pd
 import streamlit as st
 
 st.set_page_config(
-    page_title="Mobile Grooming Planner v6",
+    page_title="Mobile Grooming Planner v8",
     page_icon="🐾",
     layout="wide",
 )
 
-st.title("🐾 Mobile Grooming Planner v6")
+st.title("🐾 Mobile Grooming Planner v8")
 st.caption("Private client manager + due-date intelligence + cancellation filling + optional real drive-time scoring.")
 
 WORKDAYS = {
@@ -24,8 +24,9 @@ WORKDAYS = {
 }
 
 CLIENT_COLUMNS = [
-    "Client",
-    "Pets",
+    "Owner",
+    "Dog",
+    "Household ID",
     "Phone",
     "Area",
     "Groomer",
@@ -33,6 +34,7 @@ CLIENT_COLUMNS = [
     "Frequency Weeks",
     "Price",
     "Minutes",
+    "Household Override Minutes",
     "Address",
     "City",
     "State",
@@ -157,16 +159,18 @@ def route_metrics(origin, destination, key):
 def normalize_clients(df):
     df = df.copy()
 
-    # Accept a few human-friendly column names so the app is less fragile
-    # if a CSV was edited on a phone or exported from another system.
+    # Backward compatibility with v5-v7 files.
+    # Old "Client" becomes Owner. Old "Pets" becomes Dog.
     aliases = {
+        "Client": "Owner",
+        "Pets": "Dog",
         "Duration Minutes": "Minutes",
         "Duration": "Minutes",
         "Appointment Minutes": "Minutes",
         "Frequency": "Frequency Weeks",
         "Last Groom Date": "Last Groom",
-        "Client Name": "Client",
-        "Pet Names": "Pets",
+        "Client Name": "Owner",
+        "Pet Names": "Dog",
         "Phone Number": "Phone",
         "Zip": "ZIP",
         "Zip Code": "ZIP",
@@ -180,12 +184,24 @@ def normalize_clients(df):
         if c not in df.columns:
             df[c] = None
 
+    # Default Household ID to owner so multiple dogs belonging to the same
+    # owner can be grouped into one appointment.
+    df["Household ID"] = df["Household ID"].fillna(df["Owner"])
+    df.loc[df["Household ID"].astype(str).str.strip() == "", "Household ID"] = df["Owner"]
+
     df = df[CLIENT_COLUMNS]
 
     for c in ["Last Groom", "Last Contacted"]:
         df[c] = pd.to_datetime(df[c], errors="coerce")
 
-    for c in ["Frequency Weeks", "Price", "Minutes", "Latitude", "Longitude"]:
+    for c in [
+        "Frequency Weeks",
+        "Price",
+        "Minutes",
+        "Household Override Minutes",
+        "Latitude",
+        "Longitude",
+    ]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
     return df
@@ -338,11 +354,14 @@ def nearest_booked_neighbors(day_appts, target_time):
 
     return before, after
 
-def coords_for(client_name, clients):
-    if not client_name:
+def coords_for(owner_name, clients):
+    if not owner_name:
         return None
 
-    match = clients[clients["Client"] == client_name]
+    if "Owner" not in clients.columns:
+        return None
+
+    match = clients[clients["Owner"] == owner_name]
     if match.empty:
         return None
 
@@ -489,62 +508,151 @@ def score_candidates(
     )
 
 
-# ---------- Weekly route builder ----------
 
-AREA_GROUPS = {
-    "Woodlands": ["Woodlands"],
-    "Spring": ["Spring"],
-    "Conroe": ["Conroe"],
-    "Woodforest": ["Woodforest"],
-    "Tomball": ["Tomball"],
-    "Magnolia": ["Magnolia"],
-}
+# ---------- Household / dog-level helpers ----------
+
+def household_due_table(dog_df, target_date):
+    """Aggregate dog-level rows into one schedulable household appointment."""
+    due = calculate_due_fields(dog_df, target_date).copy()
+
+    rows = []
+    for household_id, group in due.groupby("Household ID", dropna=False):
+        group = group.copy()
+
+        owner = str(group["Owner"].dropna().iloc[0]) if group["Owner"].notna().any() else ""
+        dogs = ", ".join([str(x) for x in group["Dog"].dropna() if str(x).strip()])
+        area = str(group["Area"].dropna().iloc[0]) if group["Area"].notna().any() else ""
+        groomer = str(group["Groomer"].dropna().iloc[0]) if group["Groomer"].notna().any() else ""
+
+        # Household is considered due by the most urgent dog.
+        days_until_due = group["Days Until Due"].min() if group["Days Until Due"].notna().any() else None
+
+        if pd.isna(days_until_due):
+            status = "Unknown"
+        elif days_until_due < 0:
+            status = "🔴 Overdue"
+        elif days_until_due <= 7:
+            status = "🟠 Due this week"
+        elif days_until_due <= 14:
+            status = "🟡 Due next week"
+        else:
+            status = "🟢 Not due yet"
+
+        override = group["Household Override Minutes"].dropna()
+        if not override.empty and float(override.iloc[0]) > 0:
+            total_minutes = float(override.iloc[0])
+        else:
+            total_minutes = group["Minutes"].fillna(0).sum()
+
+        total_price = group["Price"].fillna(0).sum()
+
+        last_contacted = group["Last Contacted"].max() if group["Last Contacted"].notna().any() else pd.NaT
+        lat = group["Latitude"].dropna().iloc[0] if group["Latitude"].notna().any() else None
+        lon = group["Longitude"].dropna().iloc[0] if group["Longitude"].notna().any() else None
+        address = str(group["Address"].dropna().iloc[0]) if group["Address"].notna().any() else ""
+        city = str(group["City"].dropna().iloc[0]) if group["City"].notna().any() else ""
+        state = str(group["State"].dropna().iloc[0]) if group["State"].notna().any() else ""
+        zip_code = str(group["ZIP"].dropna().iloc[0]) if group["ZIP"].notna().any() else ""
+
+        rows.append({
+            "Household ID": household_id,
+            "Owner": owner,
+            "Dogs": dogs,
+            "Area": area,
+            "Groomer": groomer,
+            "Days Until Due": days_until_due,
+            "Status": status,
+            "Price": total_price,
+            "Minutes": total_minutes,
+            "Last Contacted": last_contacted,
+            "Latitude": lat,
+            "Longitude": lon,
+            "Address": address,
+            "City": city,
+            "State": state,
+            "ZIP": zip_code,
+        })
+
+    return pd.DataFrame(rows)
+
+def household_member_detail(dog_df, household_id):
+    group = dog_df[dog_df["Household ID"] == household_id].copy()
+    return group[["Owner", "Dog", "Minutes", "Price", "Frequency Weeks", "Last Groom"]]
+
+
+# ---------- Weekly route builder ----------
 
 def week_dates(start_date):
     monday = start_date - pd.Timedelta(days=start_date.weekday())
     return [monday + pd.Timedelta(days=i) for i in range(5)]
 
-def schedule_score(row, day_name, preferred_area=None):
+def schedule_score(row):
     score = 0
     days = row.get("Days Until Due")
 
     if pd.notna(days):
         if days < 0:
-            score += 70 + min(abs(int(days)), 30)
+            score += 80 + min(abs(int(days)), 30)
         elif days <= 7:
-            score += 45
+            score += 50
         elif days <= 14:
-            score += 25
+            score += 30
         elif days <= 21:
-            score += 10
+            score += 15
         else:
-            score -= 15
-
-    if preferred_area and str(row.get("Area", "")).strip().lower() == preferred_area.lower():
-        score += 35
+            score -= 20
 
     price = row.get("Price")
     if pd.notna(price):
         score += min(int(float(price) / 20), 12)
 
-    minutes = row.get("Minutes")
-    if pd.notna(minutes):
-        if minutes <= 90:
-            score += 8
-        elif minutes <= 120:
-            score += 4
-
     return score
 
-def build_week_plan(clients_df, week_start, daily_capacity_minutes=420):
-    due = calculate_due_fields(clients_df, week_start)
+def choose_area_for_day(pool):
+    if pool.empty:
+        return None
+
+    area_summary = (
+        pool.groupby("Area", dropna=False)
+        .agg(
+            Clients=("Client", "count"),
+            Overdue=("Days Until Due", lambda s: int((s < 0).sum())),
+            DueSoon=("Days Until Due", lambda s: int((s <= 7).sum())),
+            Revenue=("Price", "sum"),
+        )
+        .reset_index()
+    )
+
+    area_summary["Area Score"] = (
+        area_summary["Overdue"] * 100
+        + area_summary["DueSoon"] * 40
+        + area_summary["Clients"] * 15
+        + area_summary["Revenue"].fillna(0) / 10
+    )
+
+    area_summary = area_summary.sort_values(
+        ["Area Score", "Overdue", "DueSoon", "Revenue"],
+        ascending=[False, False, False, False],
+    )
+
+    return area_summary.iloc[0]["Area"]
+
+def build_week_plan(
+    clients_df,
+    week_start,
+    daily_capacity_minutes=420,
+    max_appointments_per_day=4,
+):
+    due = household_due_table(clients_df, week_start)
     due = due[due["Days Until Due"].notna()].copy()
 
-    # Focus on overdue through 3 weeks ahead for automatic planning.
+    # Automatic weekly planning considers overdue clients and clients due
+    # within the next three weeks.
     pool = due[due["Days Until Due"] <= 21].copy()
+    pool["Weekly Score"] = pool.apply(schedule_score, axis=1)
 
     days = week_dates(pd.Timestamp(week_start))
-    scheduled_clients = set()
+    scheduled_households = set()
     results = []
 
     for day_ts in days:
@@ -557,7 +665,7 @@ def build_week_plan(clients_df, week_start, daily_capacity_minutes=420):
 
             groomer_pool = pool[
                 (pool["Groomer"] == groomer)
-                & (~pool["Client"].isin(scheduled_clients))
+                & (~pool["Owner"].isin(scheduled_households))
                 & (pool["Minutes"].notna())
             ].copy()
 
@@ -567,8 +675,8 @@ def build_week_plan(clients_df, week_start, daily_capacity_minutes=420):
                     "Day": day_name,
                     "Groomer": groomer,
                     "Area Cluster": "",
-                    "Client": "",
-                    "Pets": "",
+                    "Owner": "",
+                    "Dogs": "",
                     "Status": "",
                     "Minutes": 0,
                     "Price": 0,
@@ -576,51 +684,34 @@ def build_week_plan(clients_df, week_start, daily_capacity_minutes=420):
                 })
                 continue
 
-            # Pick a dominant area based on urgent/revenue opportunity.
-            area_scores = []
-            for area_name, area_group in groomer_pool.groupby("Area"):
-                area_scores.append((
-                    area_name,
-                    area_group["Days Until Due"].fillna(999).lt(0).sum() * 100
-                    + area_group["Price"].fillna(0).sum()
-                ))
+            # ONE primary area per groomer/day.
+            preferred_area = choose_area_for_day(groomer_pool)
 
-            preferred_area = sorted(
-                area_scores,
-                key=lambda x: x[1],
-                reverse=True
-            )[0][0] if area_scores else None
+            area_pool = groomer_pool[
+                groomer_pool["Area"].astype(str).str.strip().str.lower()
+                == str(preferred_area).strip().lower()
+            ].copy()
 
-            groomer_pool["Weekly Score"] = groomer_pool.apply(
-                schedule_score,
-                axis=1,
-                args=(day_name, preferred_area),
-            )
-
-            # Prioritize same-area clients, then overall score.
-            groomer_pool["Same Area"] = (
-                groomer_pool["Area"].astype(str).str.lower()
-                == str(preferred_area).lower()
-            ).astype(int)
-
-            groomer_pool = groomer_pool.sort_values(
-                ["Same Area", "Weekly Score", "Days Until Due", "Price"],
-                ascending=[False, False, True, False],
+            area_pool = area_pool.sort_values(
+                ["Weekly Score", "Days Until Due", "Price"],
+                ascending=[False, True, False],
             )
 
             used = 0
             selected = []
 
-            for _, row in groomer_pool.iterrows():
+            for _, row in area_pool.iterrows():
                 mins = int(row["Minutes"]) if pd.notna(row["Minutes"]) else 0
                 if mins <= 0:
                     continue
+                if len(selected) >= max_appointments_per_day:
+                    break
                 if used + mins > daily_capacity_minutes:
                     continue
 
                 selected.append(row)
                 used += mins
-                scheduled_clients.add(row["Client"])
+                scheduled_households.add(row["Owner"])
 
             if not selected:
                 results.append({
@@ -628,8 +719,8 @@ def build_week_plan(clients_df, week_start, daily_capacity_minutes=420):
                     "Day": day_name,
                     "Groomer": groomer,
                     "Area Cluster": preferred_area or "",
-                    "Client": "",
-                    "Pets": "",
+                    "Owner": "",
+                    "Dogs": "",
                     "Status": "",
                     "Minutes": 0,
                     "Price": 0,
@@ -642,8 +733,8 @@ def build_week_plan(clients_df, week_start, daily_capacity_minutes=420):
                         "Day": day_name,
                         "Groomer": groomer,
                         "Area Cluster": preferred_area or row["Area"],
-                        "Client": row["Client"],
-                        "Pets": row["Pets"],
+                        "Owner": row["Owner"],
+                        "Dogs": row["Dogs"],
                         "Status": row["Status"],
                         "Minutes": int(row["Minutes"]) if pd.notna(row["Minutes"]) else 0,
                         "Price": float(row["Price"]) if pd.notna(row["Price"]) else 0,
@@ -781,7 +872,7 @@ with planner_tab:
             f"{selected_area} • {available_minutes} min"
         )
 
-    due_clients = calculate_due_fields(clients, target_date)
+    due_clients = household_due_table(clients, target_date)
 
     day_appts = appointments[
         (appointments["Date"] == target_date)
@@ -914,8 +1005,8 @@ with planner_tab:
 
         display = top[
             [
-                "Client",
-                "Pets",
+                "Owner",
+                "Dogs",
                 "Area",
                 "Status",
                 "Price",
@@ -946,24 +1037,24 @@ with planner_tab:
         best = top.iloc[0]
 
         st.success(
-            f"Best match: {best['Client']} "
-            f"({best['Pets'] or 'pet'}) — {best['Status']} — "
+            f"Best match: {best['Owner']} "
+            f"({best['Dogs'] or 'pet'}) — {best['Status']} — "
             f"{best['Area']} — ${best['Price']:.0f}"
         )
 
         suggested_text = (
-            f"Hi {best['Client']}! We had an opening come up on "
+            f"Hi {best['Owner']}! We had an opening come up on "
             f"{target_date:%A, %B %d}. Would you like to grab it?"
         )
 
         st.code(suggested_text)
 
         if st.button(
-            f"Mark {best['Client']} contacted today",
+            f"Mark {best['Owner']} contacted today",
             key="mark_best_contacted",
         ):
             idx = st.session_state.clients[
-                st.session_state.clients["Client"] == best["Client"]
+                st.session_state.clients["Household ID"] == best["Household ID"]
             ].index
 
             if len(idx):
@@ -973,6 +1064,78 @@ with planner_tab:
                 ] = pd.Timestamp(date.today())
 
             st.success("Contact date updated.")
+
+
+
+# ---------- Household / dog-level helpers ----------
+
+def household_due_table(dog_df, target_date):
+    """Aggregate dog-level rows into one schedulable household appointment."""
+    due = calculate_due_fields(dog_df, target_date).copy()
+
+    rows = []
+    for household_id, group in due.groupby("Household ID", dropna=False):
+        group = group.copy()
+
+        owner = str(group["Owner"].dropna().iloc[0]) if group["Owner"].notna().any() else ""
+        dogs = ", ".join([str(x) for x in group["Dog"].dropna() if str(x).strip()])
+        area = str(group["Area"].dropna().iloc[0]) if group["Area"].notna().any() else ""
+        groomer = str(group["Groomer"].dropna().iloc[0]) if group["Groomer"].notna().any() else ""
+
+        # Household is considered due by the most urgent dog.
+        days_until_due = group["Days Until Due"].min() if group["Days Until Due"].notna().any() else None
+
+        if pd.isna(days_until_due):
+            status = "Unknown"
+        elif days_until_due < 0:
+            status = "🔴 Overdue"
+        elif days_until_due <= 7:
+            status = "🟠 Due this week"
+        elif days_until_due <= 14:
+            status = "🟡 Due next week"
+        else:
+            status = "🟢 Not due yet"
+
+        override = group["Household Override Minutes"].dropna()
+        if not override.empty and float(override.iloc[0]) > 0:
+            total_minutes = float(override.iloc[0])
+        else:
+            total_minutes = group["Minutes"].fillna(0).sum()
+
+        total_price = group["Price"].fillna(0).sum()
+
+        last_contacted = group["Last Contacted"].max() if group["Last Contacted"].notna().any() else pd.NaT
+        lat = group["Latitude"].dropna().iloc[0] if group["Latitude"].notna().any() else None
+        lon = group["Longitude"].dropna().iloc[0] if group["Longitude"].notna().any() else None
+        address = str(group["Address"].dropna().iloc[0]) if group["Address"].notna().any() else ""
+        city = str(group["City"].dropna().iloc[0]) if group["City"].notna().any() else ""
+        state = str(group["State"].dropna().iloc[0]) if group["State"].notna().any() else ""
+        zip_code = str(group["ZIP"].dropna().iloc[0]) if group["ZIP"].notna().any() else ""
+
+        rows.append({
+            "Household ID": household_id,
+            "Owner": owner,
+            "Dogs": dogs,
+            "Area": area,
+            "Groomer": groomer,
+            "Days Until Due": days_until_due,
+            "Status": status,
+            "Price": total_price,
+            "Minutes": total_minutes,
+            "Last Contacted": last_contacted,
+            "Latitude": lat,
+            "Longitude": lon,
+            "Address": address,
+            "City": city,
+            "State": state,
+            "ZIP": zip_code,
+        })
+
+    return pd.DataFrame(rows)
+
+def household_member_detail(dog_df, household_id):
+    group = dog_df[dog_df["Household ID"] == household_id].copy()
+    return group[["Owner", "Dog", "Minutes", "Price", "Frequency Weeks", "Last Groom"]]
 
 
 # ---------- Weekly route builder ----------
@@ -990,17 +1153,28 @@ with weekly_tab:
         key="week_builder_date",
     )
 
-    daily_capacity = st.selectbox(
-        "Approximate grooming minutes available per groomer/day",
-        [300, 360, 420, 480, 540],
-        index=2,
-        format_func=lambda x: f"{x} minutes ({x/60:.1f} hrs)",
-    )
+    c1, c2 = st.columns(2)
+
+    with c1:
+        daily_capacity = st.selectbox(
+            "Approximate grooming minutes available per groomer/day",
+            [300, 360, 420, 480, 540],
+            index=2,
+            format_func=lambda x: f"{x} minutes ({x/60:.1f} hrs)",
+        )
+
+    with c2:
+        max_appointments = st.selectbox(
+            "Maximum appointments per groomer/day",
+            [3, 4, 5, 6],
+            index=1,
+        )
 
     weekly_plan = build_week_plan(
         st.session_state.clients,
         pd.Timestamp(week_start_input),
         daily_capacity_minutes=daily_capacity,
+        max_appointments_per_day=max_appointments,
     )
 
     if weekly_plan.empty:
@@ -1021,8 +1195,8 @@ with weekly_tab:
                     "Day",
                     "Groomer",
                     "Area Cluster",
-                    "Client",
-                    "Pets",
+                    "Owner",
+                    "Dogs",
                     "Status",
                     "Minutes",
                     "Price",
@@ -1036,7 +1210,7 @@ with weekly_tab:
         day_summary = (
             valid.groupby(["Date", "Day", "Groomer", "Area Cluster"], dropna=False)
             .agg(
-                Appointments=("Client", "count"),
+                Appointments=("Owner", "count"),
                 Minutes=("Minutes", "sum"),
                 Revenue=("Price", "sum"),
             )
@@ -1096,16 +1270,17 @@ with weekly_tab:
 # ---------- Client manager ----------
 
 with clients_tab:
-    st.markdown("### Add a client")
+    st.markdown("### Add a dog")
+    st.caption("One row = one dog. Dogs in the same household share the same Household ID.")
 
-    with st.form("add_client_form", clear_on_submit=True):
+    with st.form("add_dog_form", clear_on_submit=True):
         r1c1, r1c2, r1c3 = st.columns(3)
 
         with r1c1:
-            new_client = st.text_input("Client / household name")
+            new_owner = st.text_input("Owner name")
 
         with r1c2:
-            new_pets = st.text_input("Pet name(s)")
+            new_dog = st.text_input("Dog name")
 
         with r1c3:
             new_phone = st.text_input("Phone")
@@ -1113,15 +1288,23 @@ with clients_tab:
         r2c1, r2c2, r2c3 = st.columns(3)
 
         with r2c1:
-            new_area = st.text_input("Area")
-
-        with r2c2:
-            new_groomer = st.selectbox(
-                "Groomer",
-                ["Jen", "Haley"],
+            new_household = st.text_input(
+                "Household ID",
+                help="Use the same ID for multiple dogs that should be scheduled together. Usually the owner name."
             )
 
+        with r2c2:
+            new_area = st.text_input("Area")
+
         with r2c3:
+            new_groomer = st.selectbox("Groomer", ["Jen", "Haley"])
+
+        r3c1, r3c2, r3c3 = st.columns(3)
+
+        with r3c1:
+            new_last_groom = st.date_input("Last groom", value=date.today())
+
+        with r3c2:
             new_frequency = st.selectbox(
                 "Frequency",
                 [2, 3, 4, 5, 6, 8, 10, 12],
@@ -1129,54 +1312,57 @@ with clients_tab:
                 format_func=lambda x: f"Every {x} weeks",
             )
 
-        r3c1, r3c2, r3c3 = st.columns(3)
-
-        with r3c1:
-            new_last_groom = st.date_input(
-                "Last groom",
-                value=date.today(),
-            )
-
-        with r3c2:
-            new_price = st.number_input(
-                "Price",
-                min_value=0.0,
-                value=100.0,
-                step=5.0,
-            )
-
         with r3c3:
             new_minutes = st.number_input(
-                "Appointment minutes",
+                "This dog's groom time (minutes)",
                 min_value=15,
                 value=75,
                 step=15,
             )
 
-        new_address = st.text_input("Street address")
-
-        r4c1, r4c2, r4c3 = st.columns(3)
+        r4c1, r4c2 = st.columns(2)
 
         with r4c1:
-            new_city = st.text_input("City")
+            new_price = st.number_input(
+                "This dog's price",
+                min_value=0.0,
+                value=100.0,
+                step=5.0,
+            )
 
         with r4c2:
-            new_state = st.text_input("State", value="TX")
+            household_override = st.number_input(
+                "Household total-time override (optional)",
+                min_value=0,
+                value=0,
+                step=15,
+                help="Example: two dogs total 150 minutes individually, but together you know they take 125."
+            )
 
-        with r4c3:
+        new_address = st.text_input("Street address")
+
+        r5c1, r5c2, r5c3 = st.columns(3)
+        with r5c1:
+            new_city = st.text_input("City")
+        with r5c2:
+            new_state = st.text_input("State", value="TX")
+        with r5c3:
             new_zip = st.text_input("ZIP")
 
         new_notes = st.text_area("Notes")
 
-        submitted = st.form_submit_button("Add client")
+        submitted = st.form_submit_button("Add dog")
 
         if submitted:
-            if not new_client.strip():
-                st.error("Client name is required.")
+            if not new_owner.strip() or not new_dog.strip():
+                st.error("Owner name and dog name are required.")
             else:
+                household_id = new_household.strip() or new_owner.strip()
+
                 new_row = {
-                    "Client": new_client.strip(),
-                    "Pets": new_pets.strip(),
+                    "Owner": new_owner.strip(),
+                    "Dog": new_dog.strip(),
+                    "Household ID": household_id,
                     "Phone": new_phone.strip(),
                     "Area": new_area.strip(),
                     "Groomer": new_groomer,
@@ -1184,6 +1370,7 @@ with clients_tab:
                     "Frequency Weeks": new_frequency,
                     "Price": new_price,
                     "Minutes": new_minutes,
+                    "Household Override Minutes": household_override if household_override > 0 else None,
                     "Address": new_address.strip(),
                     "City": new_city.strip(),
                     "State": new_state.strip(),
@@ -1195,21 +1382,15 @@ with clients_tab:
                 }
 
                 st.session_state.clients = pd.concat(
-                    [
-                        st.session_state.clients,
-                        pd.DataFrame([new_row]),
-                    ],
+                    [st.session_state.clients, pd.DataFrame([new_row])],
                     ignore_index=True,
                 )
-
-                st.success(f"{new_client} added.")
+                st.success(f"{new_dog} added for {new_owner}.")
                 st.rerun()
 
-    st.markdown("### Edit clients")
+    st.markdown("### Edit dogs")
 
-    editor_df = clients_for_download(
-        st.session_state.clients
-    ).copy()
+    editor_df = clients_for_download(st.session_state.clients).copy()
 
     edited = st.data_editor(
         editor_df,
@@ -1217,31 +1398,25 @@ with clients_tab:
         hide_index=True,
         num_rows="dynamic",
         column_config={
-            "Frequency Weeks": st.column_config.NumberColumn(
-                "Frequency Weeks",
-                min_value=1,
-                step=1,
-            ),
-            "Price": st.column_config.NumberColumn(
-                "Price",
-                format="$%.2f",
-            ),
-            "Minutes": st.column_config.NumberColumn(
-                "Minutes",
-                min_value=15,
+            "Frequency Weeks": st.column_config.NumberColumn("Frequency Weeks", min_value=1, step=1),
+            "Price": st.column_config.NumberColumn("Price", format="$%.2f"),
+            "Minutes": st.column_config.NumberColumn("Dog Minutes", min_value=15, step=15),
+            "Household Override Minutes": st.column_config.NumberColumn(
+                "Household Override Minutes",
+                min_value=0,
                 step=15,
             ),
         },
         key="client_editor",
     )
 
-    if st.button("Save client edits", type="primary"):
+    if st.button("Save dog edits", type="primary"):
         st.session_state.clients = normalize_clients(edited)
-        st.success("Client changes saved for this session.")
+        st.success("Dog/client changes saved for this session.")
 
     st.caption(
-        "This v6 prototype keeps edits in the current Streamlit session. "
-        "Download your private CSV before ending the session so you keep the changes."
+        "Each dog gets its own time and price. The planner combines dogs with the same "
+        "Household ID into one appointment."
     )
 
 # ---------- Due list ----------
@@ -1253,7 +1428,7 @@ with due_tab:
         key="due_list_date",
     )
 
-    due_df = calculate_due_fields(
+    due_df = household_due_table(
         st.session_state.clients,
         due_date,
     )
@@ -1282,15 +1457,14 @@ with due_tab:
     )
 
     show_cols = [
-        "Client",
-        "Pets",
+        "Owner",
+        "Dogs",
         "Groomer",
         "Area",
         "Status",
-        "Last Groom",
-        "Next Due",
         "Days Until Due",
         "Price",
+        "Minutes",
         "Last Contacted",
     ]
 
@@ -1328,7 +1502,7 @@ with export_tab:
 
     st.write(
         "Your public GitHub repository should contain only the app code and "
-        "sample data. Load your real client CSV through the sidebar when you "
+        "sample data. Load your real dog/client CSV through the sidebar when you "
         "open the app, then download the updated private file when you are done."
     )
 
@@ -1342,9 +1516,9 @@ with export_tab:
     ).to_csv(index=False).encode("utf-8")
 
     st.download_button(
-        "Download my current private client file",
+        "Download my current private dog/client file",
         private_export,
-        file_name="grooming_clients_private.csv",
+        file_name="grooming_dogs_private.csv",
         mime="text/csv",
     )
 
@@ -1401,6 +1575,6 @@ with export_tab:
         st.code('GOOGLE_MAPS_API_KEY = "your-key-here"')
 
 st.caption(
-    "v6 prototype: private runtime client data + client manager + due list + planner. "
+    "v8 prototype: private runtime client data + client manager + due list + planner. "
     "A later version can add a persistent private database so edits save automatically."
 )
