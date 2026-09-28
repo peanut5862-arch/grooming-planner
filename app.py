@@ -1180,7 +1180,7 @@ with weekly_tab:
     if weekly_plan.empty:
         st.info("No clients are currently due enough to build a week.")
     else:
-        valid = weekly_plan[weekly_plan["Client"] != ""].copy()
+        valid = weekly_plan[weekly_plan["Owner"] != ""].copy()
 
         m1, m2, m3 = st.columns(3)
         m1.metric("Appointments", len(valid))
