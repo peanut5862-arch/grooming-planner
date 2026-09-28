@@ -1,9 +1,9 @@
-Client	Pets	Phone	Area	Groomer	Last Groom	Frequency Weeks	Price	Minutes	Address	City	State	ZIP	Latitude	Longitude	Last Contacted	Notes
-Oakley	Oakley		Woodlands	Jen	2026-09-17	2	95	75	1001 Example Rd	The Woodlands	TX	77380	30.1658	-95.4613	2026-09-20	
-Nikki & Lulu	Nikki, Lulu		Woodlands	Jen	2026-09-10	2	180	120	2002 Example Dr	The Woodlands	TX	77381	30.1731	-95.5005	2026-09-12	Same household
-Bo	Bo		Spring	Haley	2026-09-12	2	110	90	3003 Example Ln	Spring	TX	77380	30.0799	-95.4172	2026-09-18	
-Tanya	Tanya		Conroe	Jen	2026-09-03	2	100	75	4004 Example Ct	Conroe	TX	77301	30.3119	-95.4561	2026-09-08	
-Henry	Henry		Woodlands	Haley	2026-09-04	2	90	60	5005 Example Way	The Woodlands	TX	77382	30.206	-95.528	2026-09-10	
-Diddy	Diddy		Woodlands	Haley	2026-09-01	4	110	90	6006 Example St	The Woodlands	TX	77384	30.2298	-95.4924	2026-09-01	
-Eliza	Eliza		Woodlands	Jen	2026-08-27	4	105	75	7007 Example Blvd	The Woodlands	TX	77382	30.1942	-95.518	2026-09-02	
-Frankie	Frankie		Spring	Jen	2026-08-18	6	100	75	8008 Example Ave	Spring	TX	77373	30.0799	-95.4172	2026-08-22	
+Client,Pets,Phone,Area,Groomer,Last Groom,Frequency Weeks,Price,Duration Minutes,ZIP,Notes
+Oakley,Oakley,,Woodlands,Jen,2026-09-17,2,95,75,,
+Nikki & Lulu,"Nikki, Lulu",,Woodlands,Jen,2026-09-10,2,110,90,,
+Bo,Bo,,Spring,Haley,2026-09-12,2,110,90,3003,
+Tanya,Tanya,,Conroe,Jen,2026-09-03,2,100,75,4004,
+Henry,Henry,,Woodlands,Haley,2026-09-04,2,90,60,,
+Diddy,Diddy,,Woodlands,Haley,2026-09-01,4,110,90,,
+Eliza,Eliza,,Woodlands,Jen,2026-08-27,4,105,75,7007,
+Frankie,Frankie,,Spring,Jen,2026-08-18,6,100,75,8008,
