@@ -615,7 +615,7 @@ def choose_area_for_day(pool):
     area_summary = (
         pool.groupby("Area", dropna=False)
         .agg(
-            Clients=("Client", "count"),
+            Clients=("Owner", "count"),
             Overdue=("Days Until Due", lambda s: int((s < 0).sum())),
             DueSoon=("Days Until Due", lambda s: int((s <= 7).sum())),
             Revenue=("Price", "sum"),
