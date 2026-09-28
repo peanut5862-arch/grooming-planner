@@ -10,12 +10,12 @@ import pandas as pd
 import streamlit as st
 
 st.set_page_config(
-    page_title="Mobile Grooming Planner v5",
+    page_title="Mobile Grooming Planner v6",
     page_icon="🐾",
     layout="wide",
 )
 
-st.title("🐾 Mobile Grooming Planner v5")
+st.title("🐾 Mobile Grooming Planner v6")
 st.caption("Private client manager + due-date intelligence + cancellation filling + optional real drive-time scoring.")
 
 WORKDAYS = {
@@ -488,6 +488,171 @@ def score_candidates(
         ascending=[False, True, False],
     )
 
+
+# ---------- Weekly route builder ----------
+
+AREA_GROUPS = {
+    "Woodlands": ["Woodlands"],
+    "Spring": ["Spring"],
+    "Conroe": ["Conroe"],
+    "Woodforest": ["Woodforest"],
+    "Tomball": ["Tomball"],
+    "Magnolia": ["Magnolia"],
+}
+
+def week_dates(start_date):
+    monday = start_date - pd.Timedelta(days=start_date.weekday())
+    return [monday + pd.Timedelta(days=i) for i in range(5)]
+
+def schedule_score(row, day_name, preferred_area=None):
+    score = 0
+    days = row.get("Days Until Due")
+
+    if pd.notna(days):
+        if days < 0:
+            score += 70 + min(abs(int(days)), 30)
+        elif days <= 7:
+            score += 45
+        elif days <= 14:
+            score += 25
+        elif days <= 21:
+            score += 10
+        else:
+            score -= 15
+
+    if preferred_area and str(row.get("Area", "")).strip().lower() == preferred_area.lower():
+        score += 35
+
+    price = row.get("Price")
+    if pd.notna(price):
+        score += min(int(float(price) / 20), 12)
+
+    minutes = row.get("Minutes")
+    if pd.notna(minutes):
+        if minutes <= 90:
+            score += 8
+        elif minutes <= 120:
+            score += 4
+
+    return score
+
+def build_week_plan(clients_df, week_start, daily_capacity_minutes=420):
+    due = calculate_due_fields(clients_df, week_start)
+    due = due[due["Days Until Due"].notna()].copy()
+
+    # Focus on overdue through 3 weeks ahead for automatic planning.
+    pool = due[due["Days Until Due"] <= 21].copy()
+
+    days = week_dates(pd.Timestamp(week_start))
+    scheduled_clients = set()
+    results = []
+
+    for day_ts in days:
+        day_date = day_ts.date()
+        day_name = day_ts.strftime("%A")
+
+        for groomer, allowed_days in WORKDAYS.items():
+            if day_name not in allowed_days:
+                continue
+
+            groomer_pool = pool[
+                (pool["Groomer"] == groomer)
+                & (~pool["Client"].isin(scheduled_clients))
+                & (pool["Minutes"].notna())
+            ].copy()
+
+            if groomer_pool.empty:
+                results.append({
+                    "Date": day_date,
+                    "Day": day_name,
+                    "Groomer": groomer,
+                    "Area Cluster": "",
+                    "Client": "",
+                    "Pets": "",
+                    "Status": "",
+                    "Minutes": 0,
+                    "Price": 0,
+                    "Score": 0,
+                })
+                continue
+
+            # Pick a dominant area based on urgent/revenue opportunity.
+            area_scores = []
+            for area_name, area_group in groomer_pool.groupby("Area"):
+                area_scores.append((
+                    area_name,
+                    area_group["Days Until Due"].fillna(999).lt(0).sum() * 100
+                    + area_group["Price"].fillna(0).sum()
+                ))
+
+            preferred_area = sorted(
+                area_scores,
+                key=lambda x: x[1],
+                reverse=True
+            )[0][0] if area_scores else None
+
+            groomer_pool["Weekly Score"] = groomer_pool.apply(
+                schedule_score,
+                axis=1,
+                args=(day_name, preferred_area),
+            )
+
+            # Prioritize same-area clients, then overall score.
+            groomer_pool["Same Area"] = (
+                groomer_pool["Area"].astype(str).str.lower()
+                == str(preferred_area).lower()
+            ).astype(int)
+
+            groomer_pool = groomer_pool.sort_values(
+                ["Same Area", "Weekly Score", "Days Until Due", "Price"],
+                ascending=[False, False, True, False],
+            )
+
+            used = 0
+            selected = []
+
+            for _, row in groomer_pool.iterrows():
+                mins = int(row["Minutes"]) if pd.notna(row["Minutes"]) else 0
+                if mins <= 0:
+                    continue
+                if used + mins > daily_capacity_minutes:
+                    continue
+
+                selected.append(row)
+                used += mins
+                scheduled_clients.add(row["Client"])
+
+            if not selected:
+                results.append({
+                    "Date": day_date,
+                    "Day": day_name,
+                    "Groomer": groomer,
+                    "Area Cluster": preferred_area or "",
+                    "Client": "",
+                    "Pets": "",
+                    "Status": "",
+                    "Minutes": 0,
+                    "Price": 0,
+                    "Score": 0,
+                })
+            else:
+                for row in selected:
+                    results.append({
+                        "Date": day_date,
+                        "Day": day_name,
+                        "Groomer": groomer,
+                        "Area Cluster": preferred_area or row["Area"],
+                        "Client": row["Client"],
+                        "Pets": row["Pets"],
+                        "Status": row["Status"],
+                        "Minutes": int(row["Minutes"]) if pd.notna(row["Minutes"]) else 0,
+                        "Price": float(row["Price"]) if pd.notna(row["Price"]) else 0,
+                        "Score": int(row["Weekly Score"]),
+                    })
+
+    return pd.DataFrame(results)
+
+
 # ---------- Session data ----------
 
 if "clients" not in st.session_state:
@@ -544,8 +709,8 @@ appointments = st.session_state.appointments
 
 # ---------- Main tabs ----------
 
-planner_tab, clients_tab, due_tab, export_tab = st.tabs(
-    ["📅 Planner", "👥 Client Manager", "⏰ Due List", "🔐 Private Data"]
+planner_tab, weekly_tab, clients_tab, due_tab, export_tab = st.tabs(
+    ["📅 Planner", "🗓️ Weekly Route Builder", "👥 Client Manager", "⏰ Due List", "🔐 Private Data"]
 )
 
 # ---------- Planner ----------
@@ -649,6 +814,13 @@ with planner_tab:
         & (due_clients["Days Until Due"] <= 21)
     ].copy()
 
+    # If the user asked for a specific area, treat that as a hard filter first.
+    if selected_area != "Any":
+        candidates = candidates[
+            candidates["Area"].astype(str).str.strip().str.lower()
+            == selected_area.strip().lower()
+        ].copy()
+
     ranked = score_candidates(
         candidates,
         target_date,
@@ -670,6 +842,12 @@ with planner_tab:
             & (due_clients["Minutes"].notna())
             & (due_clients["Minutes"] <= available_minutes)
         ].copy()
+
+        if selected_area != "Any":
+            relaxed = relaxed[
+                relaxed["Area"].astype(str).str.strip().str.lower()
+                == selected_area.strip().lower()
+            ].copy()
 
         ranked = score_candidates(
             relaxed,
@@ -696,6 +874,12 @@ with planner_tab:
             & (due_clients["Minutes"].notna())
             & (due_clients["Minutes"] <= available_minutes + 30)
         ].copy()
+
+        if selected_area != "Any":
+            relaxed_more = relaxed_more[
+                relaxed_more["Area"].astype(str).str.strip().str.lower()
+                == selected_area.strip().lower()
+            ].copy()
 
         ranked = score_candidates(
             relaxed_more,
@@ -789,6 +973,125 @@ with planner_tab:
                 ] = pd.Timestamp(date.today())
 
             st.success("Contact date updated.")
+
+
+# ---------- Weekly route builder ----------
+
+with weekly_tab:
+    st.markdown("### Build the week automatically")
+    st.caption(
+        "Creates a Monday–Friday draft using due/overdue status, groomer workdays, "
+        "appointment length, area clustering, and revenue."
+    )
+
+    week_start_input = st.date_input(
+        "Week of",
+        value=date.today(),
+        key="week_builder_date",
+    )
+
+    daily_capacity = st.selectbox(
+        "Approximate grooming minutes available per groomer/day",
+        [300, 360, 420, 480, 540],
+        index=2,
+        format_func=lambda x: f"{x} minutes ({x/60:.1f} hrs)",
+    )
+
+    weekly_plan = build_week_plan(
+        st.session_state.clients,
+        pd.Timestamp(week_start_input),
+        daily_capacity_minutes=daily_capacity,
+    )
+
+    if weekly_plan.empty:
+        st.info("No clients are currently due enough to build a week.")
+    else:
+        valid = weekly_plan[weekly_plan["Client"] != ""].copy()
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Appointments", len(valid))
+        m2.metric("Projected revenue", f"${valid['Price'].sum():,.0f}")
+        m3.metric("Scheduled minutes", int(valid["Minutes"].sum()))
+
+        st.markdown("#### Weekly draft")
+        st.dataframe(
+            weekly_plan[
+                [
+                    "Date",
+                    "Day",
+                    "Groomer",
+                    "Area Cluster",
+                    "Client",
+                    "Pets",
+                    "Status",
+                    "Minutes",
+                    "Price",
+                ]
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.markdown("#### Day summaries")
+        day_summary = (
+            valid.groupby(["Date", "Day", "Groomer", "Area Cluster"], dropna=False)
+            .agg(
+                Appointments=("Client", "count"),
+                Minutes=("Minutes", "sum"),
+                Revenue=("Price", "sum"),
+            )
+            .reset_index()
+        )
+
+        st.dataframe(
+            day_summary,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.markdown("#### Open capacity")
+        capacity_rows = []
+
+        for day_ts in week_dates(pd.Timestamp(week_start_input)):
+            day_date = day_ts.date()
+            day_name = day_ts.strftime("%A")
+
+            for groomer, allowed_days in WORKDAYS.items():
+                if day_name not in allowed_days:
+                    continue
+
+                used = valid[
+                    (valid["Date"] == day_date)
+                    & (valid["Groomer"] == groomer)
+                ]["Minutes"].sum()
+
+                capacity_rows.append({
+                    "Date": day_date,
+                    "Day": day_name,
+                    "Groomer": groomer,
+                    "Used Minutes": int(used),
+                    "Open Minutes": max(int(daily_capacity - used), 0),
+                })
+
+        capacity_df = pd.DataFrame(capacity_rows)
+        st.dataframe(
+            capacity_df,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.download_button(
+            "Download weekly draft CSV",
+            weekly_plan.to_csv(index=False).encode("utf-8"),
+            file_name="weekly_route_draft.csv",
+            mime="text/csv",
+        )
+
+        st.info(
+            "This is a draft scheduler, not a final optimized route yet. "
+            "The next routing upgrade can use actual drive times between client addresses."
+        )
+
 
 # ---------- Client manager ----------
 
@@ -937,7 +1240,7 @@ with clients_tab:
         st.success("Client changes saved for this session.")
 
     st.caption(
-        "This v5 prototype keeps edits in the current Streamlit session. "
+        "This v6 prototype keeps edits in the current Streamlit session. "
         "Download your private CSV before ending the session so you keep the changes."
     )
 
@@ -1098,6 +1401,6 @@ with export_tab:
         st.code('GOOGLE_MAPS_API_KEY = "your-key-here"')
 
 st.caption(
-    "v5 prototype: private runtime client data + client manager + due list + planner. "
+    "v6 prototype: private runtime client data + client manager + due list + planner. "
     "A later version can add a persistent private database so edits save automatically."
 )
