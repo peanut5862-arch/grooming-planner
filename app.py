@@ -15,12 +15,12 @@ except Exception:
     create_client = None
 
 st.set_page_config(
-    page_title="Mobile Grooming Planner v12.2",
+    page_title="Mobile Grooming Planner v12.4",
     page_icon="🐾",
     layout="wide",
 )
 
-st.title("🐾 Mobile Grooming Planner v12.2")
+st.title("🐾 Mobile Grooming Planner v12.4")
 st.caption("Private client manager + due-date intelligence + cancellation filling + optional real drive-time scoring.")
 
 WORKDAYS = {
@@ -410,9 +410,13 @@ def score_candidates(
             elif days <= 21:
                 score += 10
 
-        if row["Groomer"] == groomer:
+        assigned_groomer = str(row["Groomer"]).strip()
+        if assigned_groomer == groomer:
             score += 30
             reasons.append(f"assigned to {groomer}")
+        elif assigned_groomer.lower() == "either":
+            score += 20
+            reasons.append("either groomer")
         else:
             score -= 100
 
@@ -793,7 +797,10 @@ def build_week_plan(
                 continue
 
             groomer_pool = pool[
-                (pool["Groomer"] == groomer)
+                (
+                    (pool["Groomer"] == groomer)
+                    | (pool["Groomer"].astype(str).str.strip().str.lower() == "either")
+                )
                 & (~pool["Owner"].isin(scheduled_households))
                 & (pool["Minutes"].notna())
             ].copy()
@@ -873,6 +880,39 @@ def build_week_plan(
     return pd.DataFrame(results)
 
 
+
+
+
+# ---------- Address helper ----------
+
+def parse_full_address(full_address):
+    """
+    Accept a pasted US-style address such as:
+    123 Main St, Conroe, TX 77301
+
+    Returns street, city, state, zip. If the format is unusual,
+    the full text is preserved in Street Address so nothing is lost.
+    """
+    raw = str(full_address or "").strip()
+    if not raw:
+        return "", "", "TX", ""
+
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+
+    # Most common format: street, city, ST ZIP
+    if len(parts) >= 3:
+        street = ", ".join(parts[:-2]).strip()
+        city = parts[-2].strip()
+        state_zip = parts[-1].strip()
+
+        match = re.match(r"^([A-Za-z]{2})\s+(\d{5}(?:-\d{4})?)$", state_zip)
+        if match:
+            return street, city, match.group(1).upper(), match.group(2)
+
+        # If state/ZIP isn't perfectly formatted, keep the original safely.
+        return raw, "", "TX", ""
+
+    return raw, "", "TX", ""
 
 
 # ---------- Household ID helpers ----------
@@ -1781,7 +1821,7 @@ with weekly_tab:
 
 with clients_tab:
     st.markdown("### Add a dog")
-    st.caption("One row = one dog. Household ID is handled automatically so dogs from the same owner can stay grouped.")
+    st.caption("One row = one dog. Household ID is automatic, and you can paste the full address in one line.")
 
     with st.form("add_dog_form", clear_on_submit=True):
         r1c1, r1c2, r1c3 = st.columns(3)
@@ -1812,7 +1852,14 @@ with clients_tab:
             new_area = st.text_input("Area")
 
         with r2c3:
-            new_groomer = st.selectbox("Groomer", ["Jen", "Haley"])
+            new_groomer = st.selectbox(
+                "Groomer",
+                ["Either", "Jen", "Haley"],
+                help=(
+                    "Choose Either when this dog can go on Jen's or Haley's route. "
+                    "The weekly planner can then place the household with either groomer."
+                ),
+            )
 
         r3c1, r3c2, r3c3 = st.columns(3)
 
@@ -1854,15 +1901,14 @@ with clients_tab:
                 help="Example: two dogs total 150 minutes individually, but together you know they take 125."
             )
 
-        new_address = st.text_input("Street address")
-
-        r5c1, r5c2, r5c3 = st.columns(3)
-        with r5c1:
-            new_city = st.text_input("City")
-        with r5c2:
-            new_state = st.text_input("State", value="TX")
-        with r5c3:
-            new_zip = st.text_input("ZIP")
+        new_full_address = st.text_input(
+            "Full address",
+            placeholder="123 Main St, Conroe, TX 77301",
+            help=(
+                "Paste the whole address in one line. The app will split it into "
+                "street, city, state, and ZIP when you save."
+            ),
+        )
 
         new_notes = st.text_area("Notes")
 
@@ -1875,6 +1921,10 @@ with clients_tab:
                 household_id = get_or_create_household_id(
                     new_owner,
                     st.session_state.clients,
+                )
+
+                new_address, new_city, new_state, new_zip = parse_full_address(
+                    new_full_address
                 )
 
                 new_row = {
