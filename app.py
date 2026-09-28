@@ -586,6 +586,123 @@ def week_dates(start_date):
     monday = start_date - pd.Timedelta(days=start_date.weekday())
     return [monday + pd.Timedelta(days=i) for i in range(5)]
 
+
+def add_minutes_to_time(start_time, minutes):
+    base = datetime.combine(date.today(), start_time)
+    return (base + pd.Timedelta(minutes=int(minutes))).time()
+
+def format_clock(t):
+    if t is None:
+        return ""
+    return datetime.combine(date.today(), t).strftime("%-I:%M %p")
+
+def assign_times_to_weekly_plan(
+    weekly_plan,
+    jen_start,
+    haley_start,
+    travel_buffer_minutes=20,
+    service_buffer_minutes=0,
+):
+    """Add estimated start/end times using saved groom duration plus buffers."""
+    if weekly_plan.empty:
+        return weekly_plan
+
+    plan = weekly_plan.copy()
+    plan["Start Time"] = ""
+    plan["End Time"] = ""
+
+    valid = plan[plan["Owner"].astype(str).str.strip() != ""].copy()
+
+    for (day_date, groomer), group in valid.groupby(["Date", "Groomer"], sort=True):
+        current = jen_start if groomer == "Jen" else haley_start
+
+        for idx in group.index:
+            duration = plan.at[idx, "Minutes"]
+            duration = int(duration) if pd.notna(duration) else 0
+
+            start_t = current
+            end_t = add_minutes_to_time(
+                start_t,
+                duration + int(service_buffer_minutes),
+            )
+
+            plan.at[idx, "Start Time"] = format_clock(start_t)
+            plan.at[idx, "End Time"] = format_clock(end_t)
+
+            current = add_minutes_to_time(
+                end_t,
+                int(travel_buffer_minutes),
+            )
+
+    return plan
+
+def render_weekly_cards(valid_plan, daily_capacity, travel_buffer):
+    if valid_plan.empty:
+        st.info("No scheduled appointments for this week.")
+        return
+
+    sorted_plan = valid_plan.sort_values(
+        ["Date", "Groomer", "Start Time", "Owner"],
+        ascending=[True, True, True, True],
+    ).copy()
+
+    for (day_date, day_name), day_group in sorted_plan.groupby(
+        ["Date", "Day"],
+        sort=True,
+    ):
+        st.markdown(f"## {day_name} · {pd.Timestamp(day_date):%b %d}")
+
+        for groomer, groomer_group in day_group.groupby("Groomer", sort=False):
+            area = ""
+            if groomer_group["Area Cluster"].notna().any():
+                area = str(groomer_group["Area Cluster"].dropna().iloc[0])
+
+            appt_count = len(groomer_group)
+            total_minutes = int(groomer_group["Minutes"].fillna(0).sum())
+            total_revenue = float(groomer_group["Price"].fillna(0).sum())
+            travel_total = max(appt_count - 1, 0) * int(travel_buffer)
+            open_minutes = max(
+                int(daily_capacity) - total_minutes - travel_total,
+                0,
+            )
+
+            st.markdown(
+                f"### {groomer}" + (f" · {area}" if area else "")
+            )
+
+            for _, row in groomer_group.iterrows():
+                owner = str(row.get("Owner", "") or "").strip()
+                dogs = str(row.get("Dogs", "") or "").strip()
+                status = str(row.get("Status", "") or "").strip()
+                start_time = str(row.get("Start Time", "") or "").strip()
+                end_time = str(row.get("End Time", "") or "").strip()
+                minutes = int(row.get("Minutes", 0) or 0)
+                price = float(row.get("Price", 0) or 0)
+
+                if not owner:
+                    continue
+
+                dog_text = f" · {dogs}" if dogs else ""
+
+                st.markdown(
+                    f"**{start_time}–{end_time}**  \n"
+                    f"**{owner}{dog_text}**  \n"
+                    f"{status} · {minutes} min · ${price:,.0f}"
+                )
+                st.divider()
+
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Appts", appt_count)
+            c2.metric("Groom min", total_minutes)
+            c3.metric("Revenue", f"${total_revenue:,.0f}")
+            c4.metric("Open min", open_minutes)
+
+            if travel_buffer:
+                st.caption(
+                    f"Estimated travel/setup buffer: {travel_buffer} min between households. "
+                    "Actual drive time will replace this when Maps routing is connected."
+                )
+
 def schedule_score(row):
     score = 0
     days = row.get("Days Until Due")
@@ -1170,11 +1287,55 @@ with weekly_tab:
             index=1,
         )
 
+    st.markdown("#### Time assumptions")
+
+    t1, t2 = st.columns(2)
+
+    with t1:
+        jen_start = st.time_input(
+            "Jen start time",
+            value=time(8, 0),
+            key="jen_week_start",
+        )
+
+    with t2:
+        haley_start = st.time_input(
+            "Haley start time",
+            value=time(8, 0),
+            key="haley_week_start",
+        )
+
+    t3, t4 = st.columns(2)
+
+    with t3:
+        travel_buffer = st.selectbox(
+            "Travel / setup buffer",
+            [10, 15, 20, 25, 30, 45],
+            index=2,
+            format_func=lambda x: f"{x} min",
+        )
+
+    with t4:
+        service_buffer = st.selectbox(
+            "Extra service buffer per household",
+            [0, 5, 10, 15],
+            index=0,
+            format_func=lambda x: f"{x} min",
+        )
+
     weekly_plan = build_week_plan(
         st.session_state.clients,
         pd.Timestamp(week_start_input),
         daily_capacity_minutes=daily_capacity,
         max_appointments_per_day=max_appointments,
+    )
+
+    weekly_plan = assign_times_to_weekly_plan(
+        weekly_plan,
+        jen_start=jen_start,
+        haley_start=haley_start,
+        travel_buffer_minutes=travel_buffer,
+        service_buffer_minutes=service_buffer,
     )
 
     if weekly_plan.empty:
@@ -1187,24 +1348,33 @@ with weekly_tab:
         m2.metric("Projected revenue", f"${valid['Price'].sum():,.0f}")
         m3.metric("Scheduled minutes", int(valid["Minutes"].sum()))
 
-        st.markdown("#### Weekly draft")
-        st.dataframe(
-            weekly_plan[
-                [
-                    "Date",
-                    "Day",
-                    "Groomer",
-                    "Area Cluster",
-                    "Owner",
-                    "Dogs",
-                    "Status",
-                    "Minutes",
-                    "Price",
-                ]
-            ],
-            use_container_width=True,
-            hide_index=True,
+        st.markdown("### Weekly schedule")
+        render_weekly_cards(
+            valid,
+            daily_capacity=daily_capacity,
+            travel_buffer=travel_buffer,
         )
+
+        with st.expander("View full weekly table"):
+            st.dataframe(
+                valid[
+                    [
+                        "Date",
+                        "Day",
+                        "Groomer",
+                        "Area Cluster",
+                        "Start Time",
+                        "End Time",
+                        "Owner",
+                        "Dogs",
+                        "Status",
+                        "Minutes",
+                        "Price",
+                    ]
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
 
         st.markdown("#### Day summaries")
         day_summary = (
@@ -1223,7 +1393,7 @@ with weekly_tab:
             hide_index=True,
         )
 
-        st.markdown("#### Open capacity")
+        st.markdown("#### Open capacity by groomer/day")
         capacity_rows = []
 
         for day_ts in week_dates(pd.Timestamp(week_start_input)):
@@ -1256,7 +1426,7 @@ with weekly_tab:
 
         st.download_button(
             "Download weekly draft CSV",
-            weekly_plan.to_csv(index=False).encode("utf-8"),
+            valid.to_csv(index=False).encode("utf-8"),
             file_name="weekly_route_draft.csv",
             mime="text/csv",
         )
