@@ -20,7 +20,7 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("🐾 Mobile Grooming Planner v12.2")
+st.title("🐾 Mobile Grooming Planner v12.1")
 st.caption("Private client manager + due-date intelligence + cancellation filling + optional real drive-time scoring.")
 
 WORKDAYS = {
@@ -1878,7 +1878,7 @@ with clients_tab:
         use_container_width=True,
         hide_index=True,
         num_rows="dynamic",
-        disabled=["Record ID"] if "Record ID" in editor_df.columns else None,
+        disabled=["Record ID"] if "Record ID" in editor_df.columns else [],
         column_config={
             "Frequency Weeks": st.column_config.NumberColumn("Frequency Weeks", min_value=1, step=1),
             "Price": st.column_config.NumberColumn("Price", format="$%.2f"),
