@@ -9,13 +9,18 @@ from datetime import date, datetime, time
 import pandas as pd
 import streamlit as st
 
+try:
+    from supabase import create_client
+except Exception:
+    create_client = None
+
 st.set_page_config(
-    page_title="Mobile Grooming Planner v10.2.2",
+    page_title="Mobile Grooming Planner v12.2",
     page_icon="🐾",
     layout="wide",
 )
 
-st.title("🐾 Mobile Grooming Planner v10.2.2")
+st.title("🐾 Mobile Grooming Planner v12.2")
 st.caption("Private client manager + due-date intelligence + cancellation filling + optional real drive-time scoring.")
 
 WORKDAYS = {
@@ -868,17 +873,261 @@ def build_week_plan(
     return pd.DataFrame(results)
 
 
+
+# ---------- Persistent private database (Supabase) ----------
+
+DB_DOG_COLUMNS = [
+    "id",
+    "owner",
+    "dog",
+    "household_id",
+    "phone",
+    "area",
+    "groomer",
+    "last_groom",
+    "frequency_weeks",
+    "price",
+    "minutes",
+    "household_override_minutes",
+    "address",
+    "city",
+    "state",
+    "zip",
+    "latitude",
+    "longitude",
+    "last_contacted",
+    "notes",
+]
+
+DB_APPT_COLUMNS = [
+    "id",
+    "date",
+    "start_time",
+    "end_time",
+    "client",
+    "area",
+    "groomer",
+]
+
+APP_TO_DB_DOG = {
+    "Owner": "owner",
+    "Dog": "dog",
+    "Household ID": "household_id",
+    "Phone": "phone",
+    "Area": "area",
+    "Groomer": "groomer",
+    "Last Groom": "last_groom",
+    "Frequency Weeks": "frequency_weeks",
+    "Price": "price",
+    "Minutes": "minutes",
+    "Household Override Minutes": "household_override_minutes",
+    "Address": "address",
+    "City": "city",
+    "State": "state",
+    "ZIP": "zip",
+    "Latitude": "latitude",
+    "Longitude": "longitude",
+    "Last Contacted": "last_contacted",
+    "Notes": "notes",
+}
+
+DB_TO_APP_DOG = {v: k for k, v in APP_TO_DB_DOG.items()}
+
+def db_secret(name, default=""):
+    try:
+        return st.secrets.get(name, default)
+    except Exception:
+        return os.getenv(name, default)
+
+def supabase_configured():
+    return bool(
+        db_secret("SUPABASE_URL", "")
+        and db_secret("SUPABASE_SERVICE_ROLE_KEY", "")
+        and create_client is not None
+    )
+
+@st.cache_resource
+def get_supabase():
+    if not supabase_configured():
+        return None
+    return create_client(
+        db_secret("SUPABASE_URL"),
+        db_secret("SUPABASE_SERVICE_ROLE_KEY"),
+    )
+
+def clean_scalar(value):
+    if pd.isna(value):
+        return None
+    if isinstance(value, pd.Timestamp):
+        return value.date().isoformat()
+    if isinstance(value, (date, datetime)):
+        return value.date().isoformat()
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except Exception:
+            pass
+    return value
+
+def dog_row_to_db(row):
+    payload = {}
+    for app_col, db_col in APP_TO_DB_DOG.items():
+        payload[db_col] = clean_scalar(row.get(app_col))
+    return payload
+
+def dogs_db_to_app(rows):
+    if not rows:
+        return normalize_clients(pd.DataFrame(columns=CLIENT_COLUMNS))
+
+    df = pd.DataFrame(rows)
+
+    for db_col, app_col in DB_TO_APP_DOG.items():
+        if db_col in df.columns:
+            df[app_col] = df[db_col]
+
+    if "id" in df.columns:
+        df["Record ID"] = df["id"]
+
+    return normalize_clients(df)
+
+def load_dogs_from_db():
+    sb = get_supabase()
+    if sb is None:
+        return None
+
+    response = (
+        sb.table("dogs")
+        .select("*")
+        .order("owner")
+        .order("dog")
+        .execute()
+    )
+    return dogs_db_to_app(response.data or [])
+
+def insert_dog_db(row_dict):
+    sb = get_supabase()
+    payload = dog_row_to_db(row_dict)
+    return sb.table("dogs").insert(payload).execute()
+
+def upsert_dogs_db(df):
+    sb = get_supabase()
+    payloads = []
+
+    for _, row in df.iterrows():
+        payload = dog_row_to_db(row)
+        record_id = row.get("Record ID")
+
+        if record_id and str(record_id).strip() and str(record_id).lower() != "nan":
+            payload["id"] = str(record_id)
+
+        payloads.append(payload)
+
+    if payloads:
+        sb.table("dogs").upsert(payloads).execute()
+
+def delete_dog_ids_db(ids):
+    sb = get_supabase()
+    for record_id in ids:
+        sb.table("dogs").delete().eq("id", str(record_id)).execute()
+
+def appointments_db_to_app(rows):
+    if not rows:
+        return normalize_appointments(pd.DataFrame(columns=APPT_COLUMNS))
+
+    df = pd.DataFrame(rows)
+    rename = {
+        "date": "Date",
+        "start_time": "Start Time",
+        "end_time": "End Time",
+        "client": "Client",
+        "area": "Area",
+        "groomer": "Groomer",
+    }
+    df = df.rename(columns=rename)
+    return normalize_appointments(df)
+
+def load_appointments_from_db():
+    sb = get_supabase()
+    if sb is None:
+        return None
+
+    response = (
+        sb.table("appointments")
+        .select("*")
+        .order("date")
+        .order("start_time")
+        .execute()
+    )
+    return appointments_db_to_app(response.data or [])
+
+def import_dogs_dataframe_to_db(df):
+    sb = get_supabase()
+    normalized = normalize_clients(df)
+    payloads = [dog_row_to_db(row) for _, row in normalized.iterrows()]
+    if payloads:
+        sb.table("dogs").insert(payloads).execute()
+    return len(payloads)
+
+def import_appointments_dataframe_to_db(df):
+    sb = get_supabase()
+    normalized = normalize_appointments(df)
+    payloads = []
+    for _, row in normalized.iterrows():
+        payloads.append({
+            "date": clean_scalar(row.get("Date")),
+            "start_time": row.get("Start Time"),
+            "end_time": row.get("End Time"),
+            "client": row.get("Client"),
+            "area": row.get("Area"),
+            "groomer": row.get("Groomer"),
+        })
+    if payloads:
+        sb.table("appointments").insert(payloads).execute()
+    return len(payloads)
+
+
 # ---------- Session data ----------
 
 if "clients" not in st.session_state:
-    st.session_state.clients = load_sample_clients()
+    if supabase_configured():
+        try:
+            loaded = load_dogs_from_db()
+            st.session_state.clients = loaded if loaded is not None else load_sample_clients()
+        except Exception as exc:
+            st.session_state.clients = load_sample_clients()
+            st.session_state.db_load_error = str(exc)
+    else:
+        st.session_state.clients = load_sample_clients()
 
 if "appointments" not in st.session_state:
-    st.session_state.appointments = load_sample_appointments()
+    if supabase_configured():
+        try:
+            loaded_appts = load_appointments_from_db()
+            st.session_state.appointments = (
+                loaded_appts if loaded_appts is not None else load_sample_appointments()
+            )
+        except Exception as exc:
+            st.session_state.appointments = load_sample_appointments()
+            st.session_state.db_appt_error = str(exc)
+    else:
+        st.session_state.appointments = load_sample_appointments()
 
 # ---------- Sidebar: private data ----------
 
 st.sidebar.header("Private data")
+
+if supabase_configured():
+    st.sidebar.success("Private database connected")
+    if st.sidebar.button("Refresh database"):
+        try:
+            st.session_state.clients = load_dogs_from_db()
+            st.session_state.appointments = load_appointments_from_db()
+            st.rerun()
+        except Exception as exc:
+            st.sidebar.error(f"Database refresh failed: {exc}")
+else:
+    st.sidebar.warning("Database not connected — session/sample mode")
+
 
 client_upload = st.sidebar.file_uploader(
     "Load your private client CSV",
@@ -890,9 +1139,19 @@ client_upload = st.sidebar.file_uploader(
 if client_upload is not None:
     uploaded_df = normalize_clients(pd.read_csv(client_upload))
 
-    if st.sidebar.button("Use this client file"):
-        st.session_state.clients = uploaded_df
-        st.sidebar.success("Private client file loaded for this session.")
+    if supabase_configured():
+        if st.sidebar.button("Import client file to private database"):
+            try:
+                count = import_dogs_dataframe_to_db(uploaded_df)
+                st.session_state.clients = load_dogs_from_db()
+                st.sidebar.success(f"Imported {count} dog records.")
+                st.rerun()
+            except Exception as exc:
+                st.sidebar.error(f"Import failed: {exc}")
+    else:
+        if st.sidebar.button("Use this client file"):
+            st.session_state.clients = uploaded_df
+            st.sidebar.success("Private client file loaded for this session.")
 
 appt_upload = st.sidebar.file_uploader(
     "Load appointments CSV",
@@ -903,14 +1162,25 @@ appt_upload = st.sidebar.file_uploader(
 if appt_upload is not None:
     uploaded_appts = normalize_appointments(pd.read_csv(appt_upload))
 
-    if st.sidebar.button("Use these appointments"):
-        st.session_state.appointments = uploaded_appts
-        st.sidebar.success("Appointments loaded.")
+    if supabase_configured():
+        if st.sidebar.button("Import appointments to private database"):
+            try:
+                count = import_appointments_dataframe_to_db(uploaded_appts)
+                st.session_state.appointments = load_appointments_from_db()
+                st.sidebar.success(f"Imported {count} appointments.")
+                st.rerun()
+            except Exception as exc:
+                st.sidebar.error(f"Appointment import failed: {exc}")
+    else:
+        if st.sidebar.button("Use these appointments"):
+            st.session_state.appointments = uploaded_appts
+            st.sidebar.success("Appointments loaded.")
 
-if st.sidebar.button("Reset to sample data"):
-    st.session_state.clients = load_sample_clients()
-    st.session_state.appointments = load_sample_appointments()
-    st.rerun()
+if not supabase_configured():
+    if st.sidebar.button("Reset to sample data"):
+        st.session_state.clients = load_sample_clients()
+        st.session_state.appointments = load_sample_appointments()
+        st.rerun()
 
 maps_key = get_maps_key()
 
@@ -1187,7 +1457,19 @@ with planner_tab:
                     "Last Contacted",
                 ] = pd.Timestamp(date.today())
 
-            st.success("Contact date updated.")
+                if supabase_configured():
+                    try:
+                        sb = get_supabase()
+                        ids = st.session_state.clients.loc[idx, "Record ID"].dropna().tolist()
+                        for record_id in ids:
+                            sb.table("dogs").update(
+                                {"last_contacted": date.today().isoformat()}
+                            ).eq("id", str(record_id)).execute()
+                        st.success("Contact date saved.")
+                    except Exception as exc:
+                        st.error(f"Contact date updated in session but database save failed: {exc}")
+                else:
+                    st.success("Contact date updated for this session.")
 
 
 
@@ -1558,22 +1840,45 @@ with clients_tab:
                     "Notes": new_notes.strip(),
                 }
 
-                st.session_state.clients = pd.concat(
-                    [st.session_state.clients, pd.DataFrame([new_row])],
-                    ignore_index=True,
-                )
-                st.success(f"{new_dog} added for {new_owner}.")
-                st.rerun()
+                if supabase_configured():
+                    try:
+                        insert_dog_db(new_row)
+                        st.session_state.clients = load_dogs_from_db()
+                        st.success(f"{new_dog} added for {new_owner} and saved.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Could not save to database: {exc}")
+                else:
+                    st.session_state.clients = pd.concat(
+                        [st.session_state.clients, pd.DataFrame([new_row])],
+                        ignore_index=True,
+                    )
+                    st.success(f"{new_dog} added for {new_owner} for this session.")
+                    st.rerun()
 
     st.markdown("### Edit dogs")
 
     editor_df = clients_for_download(st.session_state.clients).copy()
+
+    if "Record ID" in st.session_state.clients.columns:
+        editor_df.insert(
+            0,
+            "Record ID",
+            st.session_state.clients["Record ID"].values,
+        )
+
+    original_ids = set(
+        str(x)
+        for x in editor_df.get("Record ID", pd.Series(dtype=str)).dropna().tolist()
+        if str(x).strip()
+    )
 
     edited = st.data_editor(
         editor_df,
         use_container_width=True,
         hide_index=True,
         num_rows="dynamic",
+        disabled=["Record ID"] if "Record ID" in editor_df.columns else None,
         column_config={
             "Frequency Weeks": st.column_config.NumberColumn("Frequency Weeks", min_value=1, step=1),
             "Price": st.column_config.NumberColumn("Price", format="$%.2f"),
@@ -1588,13 +1893,36 @@ with clients_tab:
     )
 
     if st.button("Save dog edits", type="primary"):
-        st.session_state.clients = normalize_clients(edited)
-        st.success("Dog/client changes saved for this session.")
+        if supabase_configured():
+            try:
+                current_ids = set(
+                    str(x)
+                    for x in edited.get("Record ID", pd.Series(dtype=str)).dropna().tolist()
+                    if str(x).strip()
+                )
+                deleted_ids = original_ids - current_ids
 
-    st.caption(
-        "Each dog gets its own time and price. The planner combines dogs with the same "
-        "Household ID into one appointment."
-    )
+                if deleted_ids:
+                    delete_dog_ids_db(deleted_ids)
+
+                upsert_dogs_db(edited)
+                st.session_state.clients = load_dogs_from_db()
+                st.success("Changes saved permanently.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Database save failed: {exc}")
+        else:
+            st.session_state.clients = normalize_clients(edited)
+            st.success("Changes saved for this session only.")
+
+    if supabase_configured():
+        st.caption(
+            "Each dog gets its own time and price. Changes here save to the private database."
+        )
+    else:
+        st.caption(
+            "Session mode: changes disappear when the app restarts. Connect Supabase for permanent storage."
+        )
 
 # ---------- Due list ----------
 
@@ -1741,6 +2069,19 @@ with export_tab:
 
             st.session_state.clients = updated
             st.success("Geocoding finished for this session.")
+
+    with st.expander("Connect permanent private database"):
+        st.write("1. Create a Supabase project.")
+        st.write("2. Run the included `supabase_schema.sql` in the Supabase SQL editor.")
+        st.write("3. In Streamlit → App settings → Secrets, add:")
+        st.code(
+            'SUPABASE_URL = "https://YOURPROJECT.supabase.co"\n'
+            'SUPABASE_SERVICE_ROLE_KEY = "your-service-role-key"\n'
+            'APP_PASSWORD = "choose-a-strong-password"'
+        )
+        st.write(
+            "Never put the service-role key in GitHub. Streamlit Secrets keeps it server-side."
+        )
 
     with st.expander("Optional password protection"):
         st.write(
