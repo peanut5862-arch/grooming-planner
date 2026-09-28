@@ -20,7 +20,7 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("🐾 Mobile Grooming Planner v12.1")
+st.title("🐾 Mobile Grooming Planner v12.2")
 st.caption("Private client manager + due-date intelligence + cancellation filling + optional real drive-time scoring.")
 
 WORKDAYS = {
@@ -872,6 +872,57 @@ def build_week_plan(
 
     return pd.DataFrame(results)
 
+
+
+
+# ---------- Household ID helpers ----------
+
+def get_or_create_household_id(owner_name, clients_df):
+    """
+    Reuse an existing household ID for the same owner.
+    Otherwise create a short, readable unique ID automatically.
+    """
+    owner = str(owner_name or "").strip()
+    if not owner:
+        return ""
+
+    if clients_df is not None and not clients_df.empty:
+        same_owner = clients_df[
+            clients_df["Owner"].astype(str).str.strip().str.casefold()
+            == owner.casefold()
+        ]
+
+        if not same_owner.empty:
+            existing = (
+                same_owner["Household ID"]
+                .dropna()
+                .astype(str)
+                .str.strip()
+            )
+            existing = existing[existing != ""]
+            if not existing.empty:
+                return existing.iloc[0]
+
+        used_ids = set(
+            clients_df["Household ID"]
+            .dropna()
+            .astype(str)
+            .str.strip()
+            .str.upper()
+            .tolist()
+        )
+    else:
+        used_ids = set()
+
+    base = re.sub(r"[^A-Za-z0-9]+", "", owner.upper())[:12] or "HOUSE"
+    number = 1
+    candidate = f"{base}{number:02d}"
+
+    while candidate in used_ids:
+        number += 1
+        candidate = f"{base}{number:02d}"
+
+    return candidate
 
 
 # ---------- Persistent private database (Supabase) ----------
@@ -1730,7 +1781,7 @@ with weekly_tab:
 
 with clients_tab:
     st.markdown("### Add a dog")
-    st.caption("One row = one dog. Dogs in the same household share the same Household ID.")
+    st.caption("One row = one dog. Household ID is handled automatically so dogs from the same owner can stay grouped.")
 
     with st.form("add_dog_form", clear_on_submit=True):
         r1c1, r1c2, r1c3 = st.columns(3)
@@ -1747,9 +1798,14 @@ with clients_tab:
         r2c1, r2c2, r2c3 = st.columns(3)
 
         with r2c1:
-            new_household = st.text_input(
+            st.text_input(
                 "Household ID",
-                help="Use the same ID for multiple dogs that should be scheduled together. Usually the owner name."
+                value="Auto-generated when saved",
+                disabled=True,
+                help=(
+                    "The app creates this automatically. If this owner already has another dog, "
+                    "the same Household ID will be reused so they stay grouped as one stop."
+                ),
             )
 
         with r2c2:
@@ -1816,7 +1872,10 @@ with clients_tab:
             if not new_owner.strip() or not new_dog.strip():
                 st.error("Owner name and dog name are required.")
             else:
-                household_id = new_household.strip() or new_owner.strip()
+                household_id = get_or_create_household_id(
+                    new_owner,
+                    st.session_state.clients,
+                )
 
                 new_row = {
                     "Owner": new_owner.strip(),
