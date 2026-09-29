@@ -15,12 +15,12 @@ except Exception:
     create_client = None
 
 st.set_page_config(
-    page_title="Mobile Grooming Planner v14.3",
+    page_title="Mobile Grooming Planner v14.4",
     page_icon="🐾",
     layout="wide",
 )
 
-st.title("🐾 Mobile Grooming Planner v14.3")
+st.title("🐾 Mobile Grooming Planner v14.4")
 st.caption("Private client manager + due-date intelligence + cancellation filling + optional real drive-time scoring.")
 
 WORKDAYS = {
@@ -819,6 +819,14 @@ def format_clock(t):
         return ""
     return datetime.combine(date.today(), t).strftime("%-I:%M %p")
 
+
+def clock_sort_minutes(value):
+    """Convert a displayed clock string like 8:30 AM to minutes after midnight."""
+    parsed = parse_time(value)
+    if parsed is None:
+        return 24 * 60 + 1
+    return parsed.hour * 60 + parsed.minute
+
 def assign_times_to_weekly_plan(
     weekly_plan,
     jen_start,
@@ -838,6 +846,18 @@ def assign_times_to_weekly_plan(
 
     for (day_date, groomer), group in valid.groupby(["Date", "Groomer"], sort=True):
         current = jen_start if groomer == "Jen" else haley_start
+
+        # Earliest slots go to the most urgent clients first.
+        # Score is already driven primarily by overdue / due status.
+        sort_cols = [c for c in ["Score", "Owner"] if c in group.columns]
+        if "Score" in sort_cols:
+            group = group.sort_values(
+                ["Score", "Owner"],
+                ascending=[False, True],
+                kind="stable",
+            )
+        else:
+            group = group.sort_values(["Owner"], kind="stable")
 
         for idx in group.index:
             duration = plan.at[idx, "Minutes"]
@@ -865,10 +885,13 @@ def render_weekly_cards(valid_plan, daily_capacity, travel_buffer):
         st.info("No scheduled appointments for this week.")
         return
 
-    sorted_plan = valid_plan.sort_values(
-        ["Date", "Groomer", "Start Time", "Owner"],
+    sorted_plan = valid_plan.copy()
+    sorted_plan["_Start Sort"] = sorted_plan["Start Time"].apply(clock_sort_minutes)
+    sorted_plan = sorted_plan.sort_values(
+        ["Date", "Groomer", "_Start Sort", "Owner"],
         ascending=[True, True, True, True],
-    ).copy()
+        kind="stable",
+    )
 
     st.markdown("## Week at a glance")
 
@@ -886,6 +909,11 @@ def render_weekly_cards(valid_plan, daily_capacity, travel_buffer):
         )
 
         for groomer, groomer_group in day_group.groupby("Groomer", sort=False):
+            groomer_group = groomer_group.sort_values(
+                ["_Start Sort", "Owner"],
+                ascending=[True, True],
+                kind="stable",
+            )
             area = ""
             if groomer_group["Area Cluster"].notna().any():
                 area = str(groomer_group["Area Cluster"].dropna().iloc[0])
@@ -1067,9 +1095,21 @@ def build_week_plan(
                 == str(preferred_area).strip().lower()
             ].copy()
 
+            # Book urgent clients first. Clients not due yet can still fill
+            # otherwise-open capacity, but only after overdue/due-soon clients.
+            area_pool["_Urgency Tier"] = area_pool["Days Until Due"].apply(
+                lambda d: (
+                    0 if pd.notna(d) and d < 0
+                    else 1 if pd.notna(d) and d <= 7
+                    else 2 if pd.notna(d) and d <= 14
+                    else 3
+                )
+            )
+
             area_pool = area_pool.sort_values(
-                ["Weekly Score", "Days Until Due", "Price"],
-                ascending=[False, True, False],
+                ["_Urgency Tier", "Days Until Due", "Weekly Score", "Price"],
+                ascending=[True, True, False, False],
+                kind="stable",
             )
 
             used = 0
@@ -1110,7 +1150,11 @@ def build_week_plan(
                         "Area Cluster": preferred_area or row["Area"],
                         "Owner": row["Owner"],
                         "Dogs": row["Dogs"],
-                        "Status": row["Status"],
+                        "Status": (
+                            f"{row['Status']} · route filler"
+                            if pd.notna(row["Days Until Due"]) and row["Days Until Due"] > 7
+                            else row["Status"]
+                        ),
                         "Minutes": int(row["Minutes"]) if pd.notna(row["Minutes"]) else 0,
                         "Price": float(row["Price"]) if pd.notna(row["Price"]) else 0,
                         "Score": int(row["Weekly Score"]),
