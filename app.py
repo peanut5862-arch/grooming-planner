@@ -15,12 +15,12 @@ except Exception:
     create_client = None
 
 st.set_page_config(
-    page_title="Mobile Grooming Planner v14.5",
+    page_title="Mobile Grooming Planner v15",
     page_icon="🐾",
     layout="wide",
 )
 
-st.title("🐾 Mobile Grooming Planner v14.5")
+st.title("🐾 Mobile Grooming Planner v15")
 st.caption("Private client manager + due-date intelligence + cancellation filling + optional real drive-time scoring.")
 
 WORKDAYS = {
@@ -1017,8 +1017,10 @@ def build_week_plan(
     week_start,
     daily_capacity_minutes=420,
     max_appointments_per_day=4,
+    week_overrides=None,
 ):
     output_columns = [
+        "Household ID",
         "Date",
         "Day",
         "Groomer",
@@ -1055,6 +1057,17 @@ def build_week_plan(
     days = week_dates(pd.Timestamp(week_start))
     scheduled_households = set()
     results = []
+    week_overrides = week_overrides or {}
+
+    def requested_day_for(row):
+        household_id = str(row.get("Household ID", "") or "")
+        override = week_overrides.get(household_id, {})
+        return str(override.get("requested_day", "") or "")
+
+    def response_status_for(row):
+        household_id = str(row.get("Household ID", "") or "")
+        override = week_overrides.get(household_id, {})
+        return str(override.get("response_status", "") or "")
 
     for day_ts in days:
         day_date = day_ts.date()
@@ -1069,12 +1082,31 @@ def build_week_plan(
                     (pool["Groomer"] == groomer)
                     | (pool["Groomer"].astype(str).str.strip().str.lower() == "either")
                 )
-                & (~pool["Owner"].isin(scheduled_households))
+                & (~pool["Household ID"].astype(str).isin(scheduled_households))
                 & (pool["Minutes"].notna())
             ].copy()
 
+            if not groomer_pool.empty:
+                groomer_pool["_Requested Day"] = groomer_pool.apply(
+                    requested_day_for, axis=1
+                )
+                groomer_pool["_Response Status"] = groomer_pool.apply(
+                    response_status_for, axis=1
+                )
+
+                # A one-week client reply overrides the ideal draft without
+                # changing the client's recurring schedule.
+                groomer_pool = groomer_pool[
+                    (groomer_pool["_Response Status"] != "Skip this week")
+                    & (
+                        (groomer_pool["_Requested Day"] == "")
+                        | (groomer_pool["_Requested Day"] == day_name)
+                    )
+                ].copy()
+
             if groomer_pool.empty:
                 results.append({
+                    "Household ID": "",
                     "Date": day_date,
                     "Day": day_name,
                     "Groomer": groomer,
@@ -1088,8 +1120,16 @@ def build_week_plan(
                 })
                 continue
 
-            # ONE primary area per groomer/day.
-            preferred_area = choose_area_for_day(groomer_pool)
+            # If a client specifically requested this day, anchor the day's
+            # route area around that exception first. Otherwise choose normally.
+            forced_today = groomer_pool[
+                groomer_pool["_Requested Day"] == day_name
+            ].copy()
+
+            if not forced_today.empty:
+                preferred_area = choose_area_for_day(forced_today)
+            else:
+                preferred_area = choose_area_for_day(groomer_pool)
 
             area_pool = groomer_pool[
                 groomer_pool["Area"].astype(str).str.strip().str.lower()
@@ -1107,9 +1147,13 @@ def build_week_plan(
                 )
             )
 
+            area_pool["_Forced Today"] = (
+                area_pool["_Requested Day"] == day_name
+            ).astype(int)
+
             area_pool = area_pool.sort_values(
-                ["_Urgency Tier", "Days Until Due", "Weekly Score", "Price"],
-                ascending=[True, True, False, False],
+                ["_Forced Today", "_Urgency Tier", "Days Until Due", "Weekly Score", "Price"],
+                ascending=[False, True, True, False, False],
                 kind="stable",
             )
 
@@ -1127,10 +1171,11 @@ def build_week_plan(
 
                 selected.append(row)
                 used += mins
-                scheduled_households.add(row["Owner"])
+                scheduled_households.add(str(row["Household ID"]))
 
             if not selected:
                 results.append({
+                    "Household ID": "",
                     "Date": day_date,
                     "Day": day_name,
                     "Groomer": groomer,
@@ -1145,6 +1190,7 @@ def build_week_plan(
             else:
                 for row in selected:
                     results.append({
+                        "Household ID": row["Household ID"],
                         "Date": day_date,
                         "Day": day_name,
                         "Groomer": groomer,
@@ -2108,6 +2154,9 @@ def household_member_detail(dog_df, household_id):
 
 # ---------- Weekly route builder ----------
 
+if "week_client_responses" not in st.session_state:
+    st.session_state.week_client_responses = {}
+
 with weekly_tab:
     st.info(
         "Schedule-strict mode: this builder only uses overdue clients or clients "
@@ -2130,6 +2179,14 @@ with weekly_tab:
         value=date.today(),
         key="week_builder_date",
     )
+
+    selected_week_monday = pd.Timestamp(week_start_input) - pd.Timedelta(
+        days=pd.Timestamp(week_start_input).weekday()
+    )
+    week_key = selected_week_monday.date().isoformat()
+    if week_key not in st.session_state.week_client_responses:
+        st.session_state.week_client_responses[week_key] = {}
+    week_overrides = st.session_state.week_client_responses[week_key]
 
     c1, c2 = st.columns(2)
 
@@ -2189,6 +2246,7 @@ with weekly_tab:
         pd.Timestamp(week_start_input),
         daily_capacity_minutes=daily_capacity,
         max_appointments_per_day=max_appointments,
+        week_overrides=week_overrides,
     )
 
     weekly_plan = assign_times_to_weekly_plan(
@@ -2215,6 +2273,109 @@ with weekly_tab:
             daily_capacity=daily_capacity,
             travel_buffer=travel_buffer,
         )
+
+        st.markdown("### Client replies / this-week changes")
+        st.caption(
+            "Use this after you text clients. A day change only affects this selected week; "
+            "it does not change the client's normal recurring schedule."
+        )
+
+        due_households = household_due_table(
+            st.session_state.clients,
+            pd.Timestamp(week_start_input),
+        )
+        due_households = due_households[
+            due_households["Days Until Due"].notna()
+            & (due_households["Days Until Due"] <= 6)
+        ].copy()
+
+        if due_households.empty:
+            st.info("No due/overdue households available for client-response changes.")
+        else:
+            response_options = {}
+            for _, r in due_households.iterrows():
+                hid = str(r.get("Household ID", "") or "")
+                label = f"{r.get('Owner', '')} — {r.get('Dogs', '')}"
+                response_options[label] = hid
+
+            selected_response_client = st.selectbox(
+                "Client / household",
+                list(response_options.keys()),
+                key=f"reply_client_{week_key}",
+            )
+            selected_hid = response_options[selected_response_client]
+            current_override = week_overrides.get(selected_hid, {})
+
+            reply_statuses = [
+                "Not contacted",
+                "Awaiting reply",
+                "Confirmed",
+                "Needs different day",
+                "Skip this week",
+            ]
+            current_status = current_override.get("response_status", "Not contacted")
+            if current_status not in reply_statuses:
+                current_status = "Not contacted"
+
+            reply_status = st.selectbox(
+                "Client response",
+                reply_statuses,
+                index=reply_statuses.index(current_status),
+                key=f"reply_status_{week_key}",
+            )
+
+            requested_day = current_override.get("requested_day", "")
+            if reply_status == "Needs different day":
+                day_choices = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+                default_day_index = (
+                    day_choices.index(requested_day)
+                    if requested_day in day_choices
+                    else 0
+                )
+                requested_day = st.selectbox(
+                    "Move them to",
+                    day_choices,
+                    index=default_day_index,
+                    key=f"requested_day_{week_key}",
+                )
+            else:
+                requested_day = ""
+
+            c_reply1, c_reply2 = st.columns(2)
+            with c_reply1:
+                if st.button("Apply this-week change", type="primary"):
+                    week_overrides[selected_hid] = {
+                        "response_status": reply_status,
+                        "requested_day": requested_day,
+                    }
+                    st.session_state.week_client_responses[week_key] = week_overrides
+                    st.rerun()
+
+            with c_reply2:
+                if st.button("Clear this week's changes"):
+                    st.session_state.week_client_responses[week_key] = {}
+                    st.rerun()
+
+            if week_overrides:
+                st.markdown("#### Active this-week adjustments")
+                adjustment_rows = []
+                for hid, override in week_overrides.items():
+                    match = due_households[
+                        due_households["Household ID"].astype(str) == str(hid)
+                    ]
+                    owner = match.iloc[0]["Owner"] if not match.empty else hid
+                    dogs = match.iloc[0]["Dogs"] if not match.empty else ""
+                    adjustment_rows.append({
+                        "Client": owner,
+                        "Dogs": dogs,
+                        "Response": override.get("response_status", ""),
+                        "Requested Day": override.get("requested_day", ""),
+                    })
+                st.dataframe(
+                    pd.DataFrame(adjustment_rows),
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
         with st.expander("View full weekly table"):
             st.dataframe(
