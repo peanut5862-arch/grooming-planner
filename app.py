@@ -15,12 +15,12 @@ except Exception:
     create_client = None
 
 st.set_page_config(
-    page_title="Mobile Grooming Planner v16",
+    page_title="Mobile Grooming Planner v16.1",
     page_icon="🐾",
     layout="wide",
 )
 
-st.title("🐾 Mobile Grooming Planner v16")
+st.title("🐾 Mobile Grooming Planner v16.1")
 st.caption("Private client manager + due-date intelligence + cancellation filling + optional real drive-time scoring.")
 
 WORKDAYS = {
@@ -1721,67 +1721,75 @@ def load_month_drafts_db(month_start, month_end):
 
 
 def month_plan_dataframe(month_start, month_end):
-    """Flatten saved weekly drafts into one appointment table for a calendar month."""
+    """
+    Flatten saved weekly drafts for the calendar weeks that overlap a month.
+
+    Important: the monthly page must mirror Weekly Route Builder exactly.
+    So if September's last workweek runs into Oct 1-2, those Thu/Fri appointments
+    are shown with that week rather than appearing as falsely open.
+    """
     month_start = pd.Timestamp(month_start).normalize()
     month_end = pd.Timestamp(month_end).normalize()
 
-    records = []
+    display_start = (
+        month_start - pd.Timedelta(days=month_start.weekday())
+    ).normalize()
+    last_week_monday = (
+        month_end - pd.Timedelta(days=month_end.weekday())
+    ).normalize()
+    display_end = (last_week_monday + pd.Timedelta(days=4)).normalize()
+
+    # Store whole weeks by week-start key. DB gives persistence; current session
+    # replaces the DB copy for that same week so the monthly view immediately
+    # matches the weekly view after a move/addition.
+    week_records = {}
 
     for saved in load_month_drafts_db(month_start, month_end):
-        for item in saved.get("plan_json") or []:
-            owner = str(item.get("Owner", "") or "").strip()
-            household_id = str(item.get("Household ID", "") or "").strip()
-            raw_date = item.get("Date")
-
-            if not owner or not household_id or not raw_date:
-                continue
-
-            appt_date = pd.to_datetime(raw_date, errors="coerce")
-            if pd.isna(appt_date):
-                continue
-            appt_date = appt_date.normalize()
-
-            if not (month_start <= appt_date <= month_end):
-                continue
-
-            row = dict(item)
-            row["Date"] = appt_date.date()
-            row["Week Start"] = saved.get("week_start")
-            records.append(row)
-
-    # Include unsaved in-session drafts too, without duplicating DB records.
-    seen = {
-        (
-            str(r.get("Household ID", "")),
-            str(r.get("Date", "")),
-            str(r.get("Groomer", "")),
-        )
-        for r in records
-    }
+        week_key = str(saved.get("week_start", "") or "")
+        if not week_key:
+            continue
+        week_records[week_key] = list(saved.get("plan_json") or [])
 
     for week_key, plan in st.session_state.get("week_route_plans", {}).items():
         if plan is None or plan.empty:
             continue
-        for _, row in plan.iterrows():
-            owner = str(row.get("Owner", "") or "").strip()
-            household_id = str(row.get("Household ID", "") or "").strip()
-            raw_date = row.get("Date")
+
+        week_ts = pd.to_datetime(week_key, errors="coerce")
+        if pd.isna(week_ts):
+            continue
+        week_ts = week_ts.normalize()
+
+        if week_ts < display_start or week_ts > last_week_monday:
+            continue
+
+        week_records[str(week_key)] = [
+            row.to_dict()
+            for _, row in plan.iterrows()
+        ]
+
+    records = []
+
+    for week_key, items in week_records.items():
+        for item in items:
+            owner = str(item.get("Owner", "") or "").strip()
+            household_id = str(item.get("Household ID", "") or "").strip()
+            raw_date = item.get("Date")
+
             if not owner or not household_id or raw_date is None:
                 continue
+
             appt_date = pd.to_datetime(raw_date, errors="coerce")
             if pd.isna(appt_date):
                 continue
             appt_date = appt_date.normalize()
-            if not (month_start <= appt_date <= month_end):
+
+            if not (display_start <= appt_date <= display_end):
                 continue
-            key = (household_id, str(appt_date.date()), str(row.get("Groomer", "")))
-            if key in seen:
-                continue
-            item = row.to_dict()
-            item["Date"] = appt_date.date()
-            item["Week Start"] = week_key
-            records.append(item)
-            seen.add(key)
+
+            row = dict(item)
+            row["Date"] = appt_date.date()
+            row["Week Start"] = week_key
+            records.append(row)
 
     if not records:
         return pd.DataFrame(
@@ -1793,11 +1801,21 @@ def month_plan_dataframe(month_start, month_end):
         )
 
     df = pd.DataFrame(records)
+
+    # Exact duplicate protection only; legitimate multi-dog households are already
+    # represented as one household row in the weekly plan.
+    dedupe_cols = [
+        c for c in ["Week Start", "Household ID", "Date", "Groomer"]
+        if c in df.columns
+    ]
+    if dedupe_cols:
+        df = df.drop_duplicates(subset=dedupe_cols, keep="last")
+
     for col in ["Minutes", "Price"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
-    return df
 
+    return df
 
 def load_households_scheduled_before_week_db(week_key, lookback_weeks=4):
     """
@@ -2531,8 +2549,8 @@ def schedule_data_fingerprint(df):
 with monthly_tab:
     st.markdown("## Monthly planner")
     st.caption(
-        "See the whole month at once. This page reads the weekly drafts you have saved "
-        "and keeps each week separate."
+        "See the whole month at once. Each displayed week is the exact saved Weekly "
+        "Route Builder draft, including spillover weekdays from the month before or after."
     )
 
     month_pick = st.date_input(
@@ -2553,14 +2571,30 @@ with monthly_tab:
             "Builder and it will appear here automatically."
         )
     else:
-        total_appts = len(month_plan)
-        total_revenue = float(month_plan.get("Price", pd.Series(dtype=float)).sum())
-        total_minutes = int(month_plan.get("Minutes", pd.Series(dtype=float)).sum())
+        month_dates = pd.to_datetime(month_plan["Date"], errors="coerce")
+        month_only = month_plan[
+            (month_dates >= month_start)
+            & (month_dates <= month_end)
+        ].copy()
+
+        total_appts = len(month_only)
+        total_revenue = float(
+            month_only.get("Price", pd.Series(dtype=float)).sum()
+        )
+        total_minutes = int(
+            month_only.get("Minutes", pd.Series(dtype=float)).sum()
+        )
 
         mc1, mc2, mc3 = st.columns(3)
-        mc1.metric("Appointments", total_appts)
-        mc2.metric("Projected revenue", f"${total_revenue:,.0f}")
-        mc3.metric("Groom minutes", total_minutes)
+        mc1.metric(f"{month_start:%B} appointments", total_appts)
+        mc2.metric(f"{month_start:%B} projected revenue", f"${total_revenue:,.0f}")
+        mc3.metric(f"{month_start:%B} groom minutes", total_minutes)
+
+        st.caption(
+            "The totals above count only the selected month. The schedule below "
+            "shows complete Monday-Friday weeks, so spillover days from the prior "
+            "or next month still match Weekly Route Builder."
+        )
 
         st.markdown(f"### {month_start:%B %Y}")
 
