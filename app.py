@@ -15,12 +15,12 @@ except Exception:
     create_client = None
 
 st.set_page_config(
-    page_title="Mobile Grooming Planner v14.2",
+    page_title="Mobile Grooming Planner v14.3",
     page_icon="🐾",
     layout="wide",
 )
 
-st.title("🐾 Mobile Grooming Planner v14.2")
+st.title("🐾 Mobile Grooming Planner v14.3")
 st.caption("Private client manager + due-date intelligence + cancellation filling + optional real drive-time scoring.")
 
 WORKDAYS = {
@@ -2424,7 +2424,11 @@ with clients_tab:
             dog_entries.append({
                 "Dog": dog_name,
                 "Last Groom": dog_last_groom,
-                "Frequency Weeks": dog_frequency,
+                "Frequency Weeks": (
+                    groom_frequency
+                    if groom_frequency > 0
+                    else bath_frequency
+                ),
                 "Service Pattern": service_pattern,
                 "Next Service": next_service,
                 "Bath Frequency Weeks": bath_frequency if bath_frequency > 0 else None,
