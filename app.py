@@ -15,12 +15,12 @@ except Exception:
     create_client = None
 
 st.set_page_config(
-    page_title="Mobile Grooming Planner v14",
+    page_title="Mobile Grooming Planner v14.1",
     page_icon="🐾",
     layout="wide",
 )
 
-st.title("🐾 Mobile Grooming Planner v14")
+st.title("🐾 Mobile Grooming Planner v14.1")
 st.caption("Private client manager + due-date intelligence + cancellation filling + optional real drive-time scoring.")
 
 WORKDAYS = {
@@ -2472,7 +2472,275 @@ with clients_tab:
                     )
                     st.rerun()
 
-    st.markdown("### Edit dogs")
+    st.markdown("### Edit an existing dog")
+    st.caption(
+        "Use this form for normal edits. It is easier than editing the wide spreadsheet."
+    )
+
+    if st.session_state.clients.empty:
+        st.info("No saved dogs yet.")
+    else:
+        client_options = []
+        option_to_index = {}
+
+        for idx, row in st.session_state.clients.reset_index(drop=True).iterrows():
+            label = f"{row.get('Owner', '')} — {row.get('Dog', '')}"
+            client_options.append(label)
+            option_to_index[label] = idx
+
+        selected_client = st.selectbox(
+            "Choose client / dog",
+            client_options,
+            key="edit_existing_dog_selector",
+        )
+
+        selected_idx = option_to_index[selected_client]
+        selected_row = st.session_state.clients.reset_index(drop=True).iloc[selected_idx]
+
+        current_full_address = client_full_address(selected_row)
+
+        with st.form("edit_existing_dog_form"):
+            e1, e2 = st.columns(2)
+            with e1:
+                edit_owner = st.text_input(
+                    "Owner name",
+                    value=str(selected_row.get("Owner", "") or ""),
+                )
+            with e2:
+                edit_dog = st.text_input(
+                    "Dog name",
+                    value=str(selected_row.get("Dog", "") or ""),
+                )
+
+            e3, e4 = st.columns(2)
+            with e3:
+                edit_phone = st.text_input(
+                    "Phone",
+                    value=str(selected_row.get("Phone", "") or ""),
+                )
+            with e4:
+                groomer_options = ["Either", "Jen", "Haley"]
+                current_groomer = str(selected_row.get("Groomer", "") or "")
+                groomer_index = (
+                    groomer_options.index(current_groomer)
+                    if current_groomer in groomer_options
+                    else 0
+                )
+                edit_groomer = st.selectbox(
+                    "Groomer",
+                    groomer_options,
+                    index=groomer_index,
+                )
+
+            e5, e6 = st.columns(2)
+            with e5:
+                edit_area = st.text_input(
+                    "Area",
+                    value=str(selected_row.get("Area", "") or ""),
+                )
+            with e6:
+                freq_options = [2, 3, 4, 5, 6, 8, 10, 12]
+                current_freq = selected_row.get("Frequency Weeks")
+                try:
+                    current_freq = int(current_freq)
+                except Exception:
+                    current_freq = 4
+                freq_index = (
+                    freq_options.index(current_freq)
+                    if current_freq in freq_options
+                    else 2
+                )
+                edit_frequency = st.selectbox(
+                    "Frequency",
+                    freq_options,
+                    index=freq_index,
+                    format_func=lambda x: f"Every {x} weeks",
+                )
+
+            last_groom_value = selected_row.get("Last Groom")
+            if pd.isna(last_groom_value):
+                last_groom_value = date.today()
+            else:
+                last_groom_value = pd.Timestamp(last_groom_value).date()
+
+            edit_last_groom = st.date_input(
+                "Last groom",
+                value=last_groom_value,
+            )
+
+            pattern_options = ["Groom only", "Bath only", "Alternate: Groom/Bath"]
+            current_pattern = str(selected_row.get("Service Pattern", "") or "")
+            if current_pattern not in pattern_options:
+                current_pattern = "Groom only"
+
+            edit_pattern = st.selectbox(
+                "Service pattern",
+                pattern_options,
+                index=pattern_options.index(current_pattern),
+            )
+
+            current_next = str(selected_row.get("Next Service", "") or "")
+            if edit_pattern == "Bath only":
+                edit_next_service = "Bath"
+                st.caption("Next visit: Bath")
+            elif edit_pattern == "Groom only":
+                edit_next_service = "Groom"
+                st.caption("Next visit: Groom")
+            else:
+                next_options = ["Groom", "Bath"]
+                if current_next not in next_options:
+                    current_next = "Groom"
+                edit_next_service = st.selectbox(
+                    "Next visit service",
+                    next_options,
+                    index=next_options.index(current_next),
+                )
+
+            bp = selected_row.get("Bath Price")
+            bm = selected_row.get("Bath Minutes")
+            gp = selected_row.get("Groom Price")
+            gm = selected_row.get("Groom Minutes")
+
+            # Existing pre-v14 clients use legacy Price/Minutes as their groom defaults.
+            if pd.isna(gp):
+                gp = selected_row.get("Price")
+            if pd.isna(gm):
+                gm = selected_row.get("Minutes")
+
+            def _num_or_zero(value):
+                try:
+                    if pd.isna(value):
+                        return 0.0
+                    return float(value)
+                except Exception:
+                    return 0.0
+
+            s1, s2 = st.columns(2)
+            with s1:
+                edit_bath_price = st.number_input(
+                    "Bath price",
+                    min_value=0.0,
+                    value=_num_or_zero(bp),
+                    step=5.0,
+                )
+            with s2:
+                edit_bath_minutes = st.number_input(
+                    "Bath time (minutes)",
+                    min_value=0,
+                    value=int(_num_or_zero(bm)),
+                    step=15,
+                )
+
+            s3, s4 = st.columns(2)
+            with s3:
+                edit_groom_price = st.number_input(
+                    "Full groom price",
+                    min_value=0.0,
+                    value=_num_or_zero(gp),
+                    step=5.0,
+                )
+            with s4:
+                edit_groom_minutes = st.number_input(
+                    "Full groom time (minutes)",
+                    min_value=0,
+                    value=int(_num_or_zero(gm)),
+                    step=15,
+                )
+
+            edit_full_address = st.text_input(
+                "Full address",
+                value=current_full_address,
+            )
+
+            edit_notes = st.text_area(
+                "Notes",
+                value=str(selected_row.get("Notes", "") or ""),
+            )
+
+            save_existing = st.form_submit_button(
+                "Save client changes",
+                type="primary",
+            )
+
+            if save_existing:
+                edit_address, edit_city, edit_state, edit_zip = parse_full_address(
+                    edit_full_address
+                )
+
+                if not edit_owner.strip() or not edit_dog.strip():
+                    st.error("Owner name and dog name are required.")
+                elif edit_pattern in {"Bath only", "Alternate: Groom/Bath"} and (
+                    edit_bath_price <= 0 or edit_bath_minutes <= 0
+                ):
+                    st.error("Enter the bath price and bath time.")
+                elif edit_pattern in {"Groom only", "Alternate: Groom/Bath"} and (
+                    edit_groom_price <= 0 or edit_groom_minutes <= 0
+                ):
+                    st.error("Enter the full groom price and groom time.")
+                else:
+                    record_id = selected_row.get("Record ID")
+
+                    update_row = {
+                        "Owner": edit_owner.strip(),
+                        "Dog": edit_dog.strip(),
+                        "Household ID": selected_row.get("Household ID"),
+                        "Phone": edit_phone.strip(),
+                        "Area": edit_area.strip(),
+                        "Groomer": edit_groomer,
+                        "Last Groom": pd.Timestamp(edit_last_groom),
+                        "Frequency Weeks": edit_frequency,
+                        "Service Pattern": edit_pattern,
+                        "Next Service": edit_next_service,
+                        "Bath Price": edit_bath_price if edit_bath_price > 0 else None,
+                        "Bath Minutes": edit_bath_minutes if edit_bath_minutes > 0 else None,
+                        "Groom Price": edit_groom_price if edit_groom_price > 0 else None,
+                        "Groom Minutes": edit_groom_minutes if edit_groom_minutes > 0 else None,
+                        "Price": (
+                            edit_bath_price
+                            if edit_next_service == "Bath"
+                            else edit_groom_price
+                        ),
+                        "Minutes": (
+                            edit_bath_minutes
+                            if edit_next_service == "Bath"
+                            else edit_groom_minutes
+                        ),
+                        "Household Override Minutes": selected_row.get(
+                            "Household Override Minutes"
+                        ),
+                        "Address": edit_address,
+                        "City": edit_city,
+                        "State": edit_state,
+                        "ZIP": edit_zip,
+                        "Latitude": selected_row.get("Latitude"),
+                        "Longitude": selected_row.get("Longitude"),
+                        "Last Contacted": selected_row.get("Last Contacted"),
+                        "Notes": edit_notes.strip(),
+                    }
+
+                    if supabase_configured():
+                        try:
+                            payload = dog_row_to_db(update_row)
+                            get_supabase().table("dogs").update(payload).eq(
+                                "id",
+                                str(record_id),
+                            ).execute()
+                            st.session_state.clients = load_dogs_from_db()
+                            st.success("Client changes saved.")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"Could not save changes: {exc}")
+                    else:
+                        for key, value in update_row.items():
+                            if key in st.session_state.clients.columns:
+                                st.session_state.clients.at[selected_idx, key] = value
+                        st.success("Client changes saved for this session.")
+                        st.rerun()
+
+    st.markdown("### Advanced spreadsheet editor")
+    st.caption(
+        "Use this only for bulk edits. For one client, the form above is easier."
+    )
 
     if supabase_configured() and not st.session_state.clients.empty:
         if st.button(
