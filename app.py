@@ -15,12 +15,12 @@ except Exception:
     create_client = None
 
 st.set_page_config(
-    page_title="Mobile Grooming Planner v12.10",
+    page_title="Mobile Grooming Planner v13",
     page_icon="🐾",
     layout="wide",
 )
 
-st.title("🐾 Mobile Grooming Planner v12.10")
+st.title("🐾 Mobile Grooming Planner v13")
 st.caption("Private client manager + due-date intelligence + cancellation filling + optional real drive-time scoring.")
 
 WORKDAYS = {
@@ -2063,85 +2063,44 @@ with clients_tab:
             "Add your first real dog below."
         )
 
-    st.markdown("### Add a dog")
-    st.caption("One row = one dog. Household ID is automatic, and you can paste the full address in one line.")
+    st.markdown("### Add a household")
+    st.caption(
+        "Enter the client once, then add all of their dogs together. "
+        "The app saves each dog separately but keeps them grouped as one household stop."
+    )
 
-    with st.form("add_dog_form", clear_on_submit=True):
-        r1c1, r1c2, r1c3 = st.columns(3)
+    household_dog_count = st.number_input(
+        "How many dogs are in this household?",
+        min_value=1,
+        max_value=6,
+        value=1,
+        step=1,
+        key="new_household_dog_count",
+    )
+
+    with st.form("add_household_form", clear_on_submit=True):
+        st.markdown("#### Client / household")
+
+        r1c1, r1c2 = st.columns(2)
 
         with r1c1:
             new_owner = st.text_input("Owner name")
 
         with r1c2:
-            new_dog = st.text_input("Dog name")
-
-        with r1c3:
             new_phone = st.text_input("Phone")
 
-        r2c1, r2c2, r2c3 = st.columns(3)
+        r2c1, r2c2 = st.columns(2)
 
         with r2c1:
-            st.text_input(
-                "Household ID",
-                value="Auto-generated when saved",
-                disabled=True,
-                help=(
-                    "The app creates this automatically. If this owner already has another dog, "
-                    "the same Household ID will be reused so they stay grouped as one stop."
-                ),
-            )
-
-        with r2c2:
             new_area = st.text_input("Area")
 
-        with r2c3:
+        with r2c2:
             new_groomer = st.selectbox(
                 "Groomer",
                 ["Either", "Jen", "Haley"],
                 help=(
-                    "Choose Either when this dog can go on Jen's or Haley's route. "
-                    "The weekly planner can then place the household with either groomer."
+                    "Choose Either when this household can go on Jen's or Haley's route."
                 ),
-            )
-
-        r3c1, r3c2, r3c3 = st.columns(3)
-
-        with r3c1:
-            new_last_groom = st.date_input("Last groom", value=date.today())
-
-        with r3c2:
-            new_frequency = st.selectbox(
-                "Frequency",
-                [2, 3, 4, 5, 6, 8, 10, 12],
-                index=2,
-                format_func=lambda x: f"Every {x} weeks",
-            )
-
-        with r3c3:
-            new_minutes = st.number_input(
-                "This dog's groom time (minutes)",
-                min_value=15,
-                value=75,
-                step=15,
-            )
-
-        r4c1, r4c2 = st.columns(2)
-
-        with r4c1:
-            new_price = st.number_input(
-                "This dog's price",
-                min_value=0.0,
-                value=100.0,
-                step=5.0,
-            )
-
-        with r4c2:
-            household_override = st.number_input(
-                "Household total-time override (optional)",
-                min_value=0,
-                value=0,
-                step=15,
-                help="Example: two dogs total 150 minutes individually, but together you know they take 125."
             )
 
         new_full_address = st.text_input(
@@ -2153,13 +2112,89 @@ with clients_tab:
             ),
         )
 
-        new_notes = st.text_area("Notes")
+        household_override = st.number_input(
+            "Household total-time override (optional)",
+            min_value=0,
+            value=0,
+            step=15,
+            help=(
+                "Only use this if the combined household appointment takes a different "
+                "amount of time than the dogs' individual groom times added together."
+            ),
+        )
 
-        submitted = st.form_submit_button("Add dog")
+        new_notes = st.text_area("Household notes")
+
+        st.markdown("#### Dogs")
+        dog_entries = []
+
+        for dog_number in range(1, int(household_dog_count) + 1):
+            st.markdown(f"**Dog {dog_number}**")
+
+            d1, d2 = st.columns(2)
+            with d1:
+                dog_name = st.text_input(
+                    "Dog name",
+                    key=f"new_dog_name_{dog_number}",
+                )
+            with d2:
+                dog_last_groom = st.date_input(
+                    "Last groom",
+                    value=date.today(),
+                    key=f"new_dog_last_groom_{dog_number}",
+                )
+
+            d3, d4, d5 = st.columns(3)
+            with d3:
+                dog_frequency = st.selectbox(
+                    "Frequency",
+                    [2, 3, 4, 5, 6, 8, 10, 12],
+                    index=2,
+                    format_func=lambda x: f"{x} weeks",
+                    key=f"new_dog_frequency_{dog_number}",
+                )
+            with d4:
+                dog_minutes = st.number_input(
+                    "Groom time",
+                    min_value=15,
+                    value=75,
+                    step=15,
+                    key=f"new_dog_minutes_{dog_number}",
+                )
+            with d5:
+                dog_price = st.number_input(
+                    "Price",
+                    min_value=0.0,
+                    value=100.0,
+                    step=5.0,
+                    key=f"new_dog_price_{dog_number}",
+                )
+
+            dog_entries.append({
+                "Dog": dog_name,
+                "Last Groom": dog_last_groom,
+                "Frequency Weeks": dog_frequency,
+                "Minutes": dog_minutes,
+                "Price": dog_price,
+            })
+
+        submitted = st.form_submit_button("Save household")
 
         if submitted:
-            if not new_owner.strip() or not new_dog.strip():
-                st.error("Owner name and dog name are required.")
+            missing_names = [
+                str(i + 1)
+                for i, dog in enumerate(dog_entries)
+                if not str(dog["Dog"]).strip()
+            ]
+
+            if not new_owner.strip():
+                st.error("Owner name is required.")
+            elif missing_names:
+                st.error(
+                    "Enter a dog name for dog "
+                    + ", ".join(missing_names)
+                    + "."
+                )
             else:
                 household_id = get_or_create_household_id(
                     new_owner,
@@ -2170,43 +2205,59 @@ with clients_tab:
                     new_full_address
                 )
 
-                new_row = {
-                    "Owner": new_owner.strip(),
-                    "Dog": new_dog.strip(),
-                    "Household ID": household_id,
-                    "Phone": new_phone.strip(),
-                    "Area": new_area.strip(),
-                    "Groomer": new_groomer,
-                    "Last Groom": pd.Timestamp(new_last_groom),
-                    "Frequency Weeks": new_frequency,
-                    "Price": new_price,
-                    "Minutes": new_minutes,
-                    "Household Override Minutes": household_override if household_override > 0 else None,
-                    "Address": new_address.strip(),
-                    "City": new_city.strip(),
-                    "State": new_state.strip(),
-                    "ZIP": new_zip.strip(),
-                    "Latitude": None,
-                    "Longitude": None,
-                    "Last Contacted": pd.NaT,
-                    "Notes": new_notes.strip(),
-                }
+                new_rows = []
+
+                for dog in dog_entries:
+                    new_rows.append({
+                        "Owner": new_owner.strip(),
+                        "Dog": str(dog["Dog"]).strip(),
+                        "Household ID": household_id,
+                        "Phone": new_phone.strip(),
+                        "Area": new_area.strip(),
+                        "Groomer": new_groomer,
+                        "Last Groom": pd.Timestamp(dog["Last Groom"]),
+                        "Frequency Weeks": dog["Frequency Weeks"],
+                        "Price": dog["Price"],
+                        "Minutes": dog["Minutes"],
+                        "Household Override Minutes": (
+                            household_override if household_override > 0 else None
+                        ),
+                        "Address": new_address.strip(),
+                        "City": new_city.strip(),
+                        "State": new_state.strip(),
+                        "ZIP": new_zip.strip(),
+                        "Latitude": None,
+                        "Longitude": None,
+                        "Last Contacted": pd.NaT,
+                        "Notes": new_notes.strip(),
+                    })
 
                 if supabase_configured():
                     try:
                         get_supabase.clear()
-                        insert_dog_db(new_row)
+                        sb = get_supabase()
+                        payloads = [dog_row_to_db(row) for row in new_rows]
+                        sb.table("dogs").insert(payloads).execute()
                         st.session_state.clients = load_dogs_from_db()
-                        st.success(f"{new_dog} added for {new_owner} and saved.")
+
+                        dog_names = ", ".join(row["Dog"] for row in new_rows)
+                        st.success(
+                            f"Saved {new_owner} with {len(new_rows)} dog(s): {dog_names}."
+                        )
                         st.rerun()
                     except Exception as exc:
-                        st.error(f"Could not save to database: {exc}")
+                        st.error(f"Could not save household: {exc}")
                 else:
                     st.session_state.clients = pd.concat(
-                        [st.session_state.clients, pd.DataFrame([new_row])],
+                        [
+                            st.session_state.clients,
+                            pd.DataFrame(new_rows),
+                        ],
                         ignore_index=True,
                     )
-                    st.success(f"{new_dog} added for {new_owner} for this session.")
+                    st.success(
+                        f"Saved {new_owner} with {len(new_rows)} dog(s) for this session."
+                    )
                     st.rerun()
 
     st.markdown("### Edit dogs")
