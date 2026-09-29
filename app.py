@@ -15,12 +15,12 @@ except Exception:
     create_client = None
 
 st.set_page_config(
-    page_title="Mobile Grooming Planner v21",
+    page_title="Mobile Grooming Planner v21.2",
     page_icon="🐾",
     layout="wide",
 )
 
-st.title("🐾 Mobile Grooming Planner v21")
+st.title("🐾 Mobile Grooming Planner v21.2")
 st.caption("Private client manager + due-date intelligence + cancellation filling + optional real drive-time scoring.")
 
 WORKDAYS = {
@@ -5924,17 +5924,23 @@ with due_tab:
     due_filter = st.selectbox(
         "Show",
         [
-            "Overdue + next 2 weeks",
-            "Overdue only",
+            "Due this week",
+            "Overdue",
             "All clients",
         ],
     )
 
-    if due_filter == "Overdue + next 2 weeks":
+    due_date_ts = pd.Timestamp(due_date).normalize()
+    days_to_week_end = max(4 - due_date_ts.weekday(), 0)
+
+    if due_filter == "Due this week":
+        # Due this week = today through Friday only.
+        # Overdue clients stay separate in the Overdue view.
         due_df = due_df[
-            due_df["Days Until Due"] <= 14
+            (due_df["Days Until Due"] >= 0)
+            & (due_df["Days Until Due"] <= days_to_week_end)
         ]
-    elif due_filter == "Overdue only":
+    elif due_filter == "Overdue":
         due_df = due_df[
             due_df["Days Until Due"] < 0
         ]
