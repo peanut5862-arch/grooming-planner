@@ -15,12 +15,12 @@ except Exception:
     create_client = None
 
 st.set_page_config(
-    page_title="Mobile Grooming Planner v18",
+    page_title="Mobile Grooming Planner v18.1",
     page_icon="🐾",
     layout="wide",
 )
 
-st.title("🐾 Mobile Grooming Planner v18")
+st.title("🐾 Mobile Grooming Planner v18.1")
 st.caption("Private client manager + due-date intelligence + cancellation filling + optional real drive-time scoring.")
 
 WORKDAYS = {
@@ -2757,9 +2757,11 @@ with monthly_tab:
 
     with nav1:
         if st.button("‹ Previous", key="month_prev", use_container_width=True):
-            st.session_state["monthly_planner_date"] = (
+            new_month = (
                 pd.Timestamp(saved_month) - pd.offsets.MonthBegin(1)
-            ).date()
+            ).replace(day=1).date()
+            st.session_state["monthly_planner_date"] = new_month
+            st.session_state["monthly_month_picker"] = new_month
             st.rerun()
 
     with nav2:
@@ -2771,14 +2773,19 @@ with monthly_tab:
 
     with nav3:
         if st.button("Next ›", key="month_next", use_container_width=True):
-            st.session_state["monthly_planner_date"] = (
+            new_month = (
                 pd.Timestamp(saved_month) + pd.offsets.MonthBegin(1)
-            ).date()
+            ).replace(day=1).date()
+            st.session_state["monthly_planner_date"] = new_month
+            st.session_state["monthly_month_picker"] = new_month
             st.rerun()
+
+    if "monthly_month_picker" not in st.session_state:
+        st.session_state["monthly_month_picker"] = saved_month
 
     jump_month = st.date_input(
         "Jump to month",
-        value=saved_month,
+        value=st.session_state["monthly_month_picker"],
         key="monthly_month_picker",
         help="Pick any date in the month you want to view.",
     )
