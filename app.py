@@ -15,12 +15,12 @@ except Exception:
     create_client = None
 
 st.set_page_config(
-    page_title="Mobile Grooming Planner v17",
+    page_title="Mobile Grooming Planner v18",
     page_icon="🐾",
     layout="wide",
 )
 
-st.title("🐾 Mobile Grooming Planner v17")
+st.title("🐾 Mobile Grooming Planner v18")
 st.caption("Private client manager + due-date intelligence + cancellation filling + optional real drive-time scoring.")
 
 WORKDAYS = {
@@ -1844,6 +1844,173 @@ def month_plan_dataframe(month_start, month_end):
 
     return df
 
+
+def _service_value(row, service, kind):
+    """Return price/minutes for a projected Bath or Groom service."""
+    if service == "Bath":
+        value = row.get("Bath Price") if kind == "price" else row.get("Bath Minutes")
+    else:
+        value = row.get("Groom Price") if kind == "price" else row.get("Groom Minutes")
+
+    if value is None or pd.isna(value):
+        value = row.get("Price") if kind == "price" else row.get("Minutes")
+
+    try:
+        return float(value or 0)
+    except Exception:
+        return 0.0
+
+
+def _advance_due_into_window(last_date, weeks, window_start):
+    """Find the first recurring due date on or after window_start."""
+    last_date = _safe_date(last_date)
+    weeks = _safe_weeks(weeks)
+
+    if last_date is None or not weeks:
+        return None
+
+    due = pd.Timestamp(last_date).normalize() + pd.Timedelta(weeks=weeks)
+    step = pd.Timedelta(weeks=weeks)
+    window_start = pd.Timestamp(window_start).normalize()
+
+    for _ in range(600):
+        if due >= window_start:
+            return due
+        due += step
+
+    return None
+
+
+def projected_month_services(dog_df, month_start, month_end):
+    """
+    Project recurring Bath/Groom work into a future month.
+    This is planning information only and does not create appointments.
+    """
+    columns = [
+        "Household ID", "Owner", "Dogs", "Projected Due", "Area", "Groomer",
+        "Minutes", "Price",
+    ]
+
+    if dog_df is None or dog_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    month_start = pd.Timestamp(month_start).normalize()
+    month_end = pd.Timestamp(month_end).normalize()
+    raw = []
+
+    for _, row in dog_df.iterrows():
+        hid = str(row.get("Household ID", "") or "").strip()
+        owner = str(row.get("Owner", "") or "").strip()
+        dog = str(row.get("Dog", "") or "").strip()
+        if not hid or not owner:
+            continue
+
+        service_specs = []
+        bath_weeks = _safe_weeks(row.get("Bath Frequency Weeks"))
+        groom_weeks = _safe_weeks(row.get("Groom Frequency Weeks"))
+
+        if bath_weeks:
+            service_specs.append(("Bath", row.get("Last Bath"), bath_weeks))
+
+        if groom_weeks:
+            last_groom = row.get("Last Groom Service")
+            if last_groom is None or pd.isna(last_groom):
+                last_groom = row.get("Last Groom")
+            service_specs.append(("Groom", last_groom, groom_weeks))
+
+        # Legacy clients without separate Bath/Groom cadence.
+        if not service_specs:
+            legacy_weeks = _safe_weeks(row.get("Frequency Weeks"))
+            legacy_last = row.get("Last Groom")
+            if legacy_weeks and _safe_date(legacy_last) is not None:
+                legacy_service = effective_service_for_dog(
+                    row,
+                    target_date=month_start,
+                )
+                service_specs.append(
+                    (legacy_service, legacy_last, legacy_weeks)
+                )
+
+        for service, last_date, weeks in service_specs:
+            due = _advance_due_into_window(last_date, weeks, month_start)
+            if due is None:
+                continue
+
+            step = pd.Timedelta(weeks=weeks)
+
+            for _ in range(20):
+                if due > month_end:
+                    break
+
+                raw.append({
+                    "Household ID": hid,
+                    "Owner": owner,
+                    "Dog": dog,
+                    "Service": service,
+                    "Projected Due": due.date(),
+                    "Area": str(row.get("Area", "") or ""),
+                    "Groomer": str(row.get("Groomer", "") or ""),
+                    "Minutes": _service_value(row, service, "minutes"),
+                    "Price": _service_value(row, service, "price"),
+                })
+                due += step
+
+    if not raw:
+        return pd.DataFrame(columns=columns)
+
+    raw_df = pd.DataFrame(raw)
+
+    # If Bath and Groom land on the same day for one dog, the full groom
+    # replaces the bath so the visit is not double-counted.
+    raw_df["_Service Priority"] = raw_df["Service"].map(
+        {"Bath": 1, "Groom": 2}
+    ).fillna(0)
+
+    raw_df = raw_df.sort_values(
+        ["Household ID", "Dog", "Projected Due", "_Service Priority"],
+        ascending=[True, True, True, False],
+        kind="stable",
+    ).drop_duplicates(
+        subset=["Household ID", "Dog", "Projected Due"],
+        keep="first",
+    )
+
+    rows = []
+    for (hid, due_date), group in raw_df.groupby(
+        ["Household ID", "Projected Due"],
+        sort=True,
+    ):
+        first = group.iloc[0]
+        dog_labels = []
+
+        for _, r in group.iterrows():
+            dog_name = str(r.get("Dog", "") or "").strip()
+            service = str(r.get("Service", "") or "").strip()
+            if dog_name:
+                dog_labels.append(f"{dog_name} ({service})")
+
+        rows.append({
+            "Household ID": hid,
+            "Owner": first.get("Owner", ""),
+            "Dogs": ", ".join(dog_labels),
+            "Projected Due": due_date,
+            "Area": first.get("Area", ""),
+            "Groomer": first.get("Groomer", ""),
+            "Minutes": int(
+                pd.to_numeric(group["Minutes"], errors="coerce")
+                .fillna(0)
+                .sum()
+            ),
+            "Price": float(
+                pd.to_numeric(group["Price"], errors="coerce")
+                .fillna(0)
+                .sum()
+            ),
+        })
+
+    return pd.DataFrame(rows, columns=columns)
+
+
 def load_households_scheduled_before_week_db(week_key, lookback_weeks=4):
     """
     Return household IDs that are already placed in a saved weekly draft
@@ -2578,71 +2745,145 @@ def schedule_data_fingerprint(df):
 with monthly_tab:
     st.markdown("## Monthly planner")
     st.info(
-        "Only confirmed weeks count as your real schedule here. Old test drafts stay hidden."
-    )
-    st.caption(
-        "See the whole month at once. This page shows CONFIRMED weekly schedules only, "
-        "including spillover weekdays from the month before or after."
+        "Confirmed weeks are your real schedule. Future recurring work is shown "
+        "separately as projected / unscheduled until you build and confirm it."
     )
 
-    month_pick = st.date_input(
-        "Month",
-        value=st.session_state.get("monthly_planner_date", date.today()),
-        key="monthly_planner_date",
+    saved_month = pd.Timestamp(
+        st.session_state.get("monthly_planner_date", date.today())
+    ).replace(day=1).date()
+
+    nav1, nav2, nav3 = st.columns([1, 2, 1])
+
+    with nav1:
+        if st.button("‹ Previous", key="month_prev", use_container_width=True):
+            st.session_state["monthly_planner_date"] = (
+                pd.Timestamp(saved_month) - pd.offsets.MonthBegin(1)
+            ).date()
+            st.rerun()
+
+    with nav2:
+        st.markdown(
+            f"<div style='text-align:center;font-size:1.35rem;font-weight:700;"
+            f"padding-top:0.45rem'>{pd.Timestamp(saved_month):%B %Y}</div>",
+            unsafe_allow_html=True,
+        )
+
+    with nav3:
+        if st.button("Next ›", key="month_next", use_container_width=True):
+            st.session_state["monthly_planner_date"] = (
+                pd.Timestamp(saved_month) + pd.offsets.MonthBegin(1)
+            ).date()
+            st.rerun()
+
+    jump_month = st.date_input(
+        "Jump to month",
+        value=saved_month,
+        key="monthly_month_picker",
+        help="Pick any date in the month you want to view.",
     )
-    month_start = pd.Timestamp(month_pick).replace(day=1).normalize()
-    month_end = (
-        month_start + pd.offsets.MonthEnd(1)
-    ).normalize()
+
+    picked_month = pd.Timestamp(jump_month).replace(day=1).date()
+    if picked_month != saved_month:
+        st.session_state["monthly_planner_date"] = picked_month
+        st.rerun()
+
+    month_start = pd.Timestamp(saved_month).normalize()
+    month_end = (month_start + pd.offsets.MonthEnd(1)).normalize()
 
     month_plan = month_plan_dataframe(month_start, month_end)
 
-    if month_plan.empty:
-        st.info(
-            "No confirmed appointments are on this month yet. Build and adjust a week in "
-            "Weekly Route Builder, then tap Confirm this week."
-        )
-    else:
+    if not month_plan.empty:
         month_dates = pd.to_datetime(month_plan["Date"], errors="coerce")
         month_only = month_plan[
             (month_dates >= month_start)
             & (month_dates <= month_end)
         ].copy()
+    else:
+        month_only = month_plan.copy()
 
-        total_appts = len(month_only)
-        total_revenue = float(
-            month_only.get("Price", pd.Series(dtype=float)).sum()
+    confirmed_appts = len(month_only)
+    confirmed_revenue = float(
+        month_only.get("Price", pd.Series(dtype=float)).sum()
+    ) if not month_only.empty else 0.0
+    confirmed_minutes = int(
+        month_only.get("Minutes", pd.Series(dtype=float)).sum()
+    ) if not month_only.empty else 0
+
+    projected = projected_month_services(
+        st.session_state.clients,
+        month_start,
+        month_end,
+    )
+
+    confirmed_hids = set(
+        month_only.get("Household ID", pd.Series(dtype=str))
+        .dropna()
+        .astype(str)
+        .tolist()
+    ) if not month_only.empty else set()
+
+    # If a household already has a confirmed appointment somewhere in this
+    # month, keep it out of the unscheduled projection list.
+    projected_unscheduled = projected[
+        ~projected["Household ID"].astype(str).isin(confirmed_hids)
+    ].copy() if not projected.empty else projected.copy()
+
+    projected_revenue = float(
+        projected_unscheduled.get("Price", pd.Series(dtype=float)).sum()
+    ) if not projected_unscheduled.empty else 0.0
+    projected_minutes = int(
+        projected_unscheduled.get("Minutes", pd.Series(dtype=float)).sum()
+    ) if not projected_unscheduled.empty else 0
+
+    st.markdown(f"### {month_start:%B %Y} overview")
+
+    m1, m2 = st.columns(2)
+    m1.metric("Confirmed appointments", confirmed_appts)
+    m2.metric("Confirmed revenue", f"${confirmed_revenue:,.0f}")
+
+    p1, p2 = st.columns(2)
+    p1.metric("Projected unscheduled stops", len(projected_unscheduled))
+    p2.metric(
+        "Projected unscheduled revenue",
+        f"${projected_revenue:,.0f}",
+    )
+
+    st.caption(
+        f"Confirmed groom time: {confirmed_minutes} min · "
+        f"Projected unscheduled time: {projected_minutes} min. "
+        "Projections come from each dog's saved recurring Bath/Groom cadence."
+    )
+
+    st.markdown("### Confirmed schedule")
+
+    if month_plan.empty:
+        st.info(
+            "No confirmed appointments are on this month yet. Build and adjust "
+            "a week in Weekly Route Builder, then tap Confirm this week."
         )
-        total_minutes = int(
-            month_only.get("Minutes", pd.Series(dtype=float)).sum()
+    else:
+        month_plan["_Date Sort"] = pd.to_datetime(
+            month_plan["Date"],
+            errors="coerce",
         )
-
-        mc1, mc2, mc3 = st.columns(3)
-        mc1.metric(f"{month_start:%B} appointments", total_appts)
-        mc2.metric(f"{month_start:%B} projected revenue", f"${total_revenue:,.0f}")
-        mc3.metric(f"{month_start:%B} groom minutes", total_minutes)
-
-        st.caption(
-            "The totals above count only the selected month. The schedule below "
-            "shows complete Monday-Friday weeks, so spillover days from the prior "
-            "or next month still match Weekly Route Builder."
-        )
-
-        st.markdown(f"### {month_start:%B %Y}")
-
-        # One compact section per calendar week. This keeps the full month visible
-        # without forcing a tiny 5-column phone layout.
-        month_plan["_Date Sort"] = pd.to_datetime(month_plan["Date"], errors="coerce")
         monday_series = (
             month_plan["_Date Sort"]
-            - pd.to_timedelta(month_plan["_Date Sort"].dt.weekday, unit="D")
+            - pd.to_timedelta(
+                month_plan["_Date Sort"].dt.weekday,
+                unit="D",
+            )
         )
         month_plan["_Week Monday"] = monday_series.dt.date
 
-        for week_monday, week_group in month_plan.groupby("_Week Monday", sort=True):
+        for week_monday, week_group in month_plan.groupby(
+            "_Week Monday",
+            sort=True,
+        ):
             week_monday_ts = pd.Timestamp(week_monday)
-            week_friday_ts = week_monday_ts + pd.Timedelta(days=4)
-            week_revenue = float(week_group["Price"].sum()) if "Price" in week_group.columns else 0
+            week_revenue = float(
+                week_group["Price"].sum()
+            ) if "Price" in week_group.columns else 0
             week_count = len(week_group)
 
             st.markdown(
@@ -2658,19 +2899,28 @@ with monthly_tab:
                 ].copy()
 
                 if day_rows.empty:
-                    st.markdown(f"**{day_ts:%A · %b %d}** — _open_")
+                    st.markdown(
+                        f"**{day_ts:%A · %b %d}** — _open_"
+                    )
                     continue
 
                 day_rows["_Start Sort"] = day_rows.get(
                     "Start Time",
-                    pd.Series([""] * len(day_rows), index=day_rows.index),
+                    pd.Series(
+                        [""] * len(day_rows),
+                        index=day_rows.index,
+                    ),
                 ).apply(clock_sort_minutes)
+
                 day_rows = day_rows.sort_values(
                     ["_Start Sort", "Groomer", "Owner"],
                     kind="stable",
                 )
 
-                day_revenue = float(day_rows["Price"].sum()) if "Price" in day_rows.columns else 0
+                day_revenue = float(
+                    day_rows["Price"].sum()
+                ) if "Price" in day_rows.columns else 0
+
                 st.markdown(
                     f"**{day_ts:%A · %b %d}** "
                     f"· {len(day_rows)} appts · ${day_revenue:,.0f}"
@@ -2687,87 +2937,98 @@ with monthly_tab:
                     details = " · ".join(
                         [part for part in [groomer, area] if part]
                     )
-                    time_prefix = f"{start_time} · " if start_time else ""
+                    time_prefix = (
+                        f"{start_time} · " if start_time else ""
+                    )
                     dog_text = f" / {dogs}" if dogs else ""
 
                     st.markdown(
                         f"- **{time_prefix}{owner}{dog_text}**"
-                        f"{' · ' + details if details else ''} · ${price:,.0f}"
+                        f"{' · ' + details if details else ''} "
+                        f"· ${price:,.0f}"
                     )
 
             st.divider()
 
-    # Show who is due this month but not yet in any saved monthly appointment.
-    month_due = household_due_table(
-        st.session_state.clients,
-        month_start,
+    st.markdown("### Projected / unscheduled this month")
+    st.caption(
+        "These are expected from the recurring service schedules, but they are "
+        "not appointments yet. Build the appropriate week to actually schedule them."
     )
 
-    if not month_due.empty and "Days Until Due" in month_due.columns:
-        month_due = month_due.copy()
-        month_due["Due Date"] = month_due["Days Until Due"].apply(
-            lambda x: (
-                month_start + pd.Timedelta(days=float(x))
-                if pd.notna(x)
-                else pd.NaT
-            )
+    if projected_unscheduled.empty:
+        st.success(
+            "No additional recurring clients are currently projected for this month."
         )
+    else:
+        projected_unscheduled["Projected Due"] = pd.to_datetime(
+            projected_unscheduled["Projected Due"],
+            errors="coerce",
+        ).dt.date
 
-        scheduled_hids = set(
-            month_plan.get("Household ID", pd.Series(dtype=str))
-            .dropna()
-            .astype(str)
-            .tolist()
-        )
-
-        unscheduled = month_due[
-            month_due["Due Date"].notna()
-            & (month_due["Due Date"] >= month_start)
-            & (month_due["Due Date"] <= month_end)
-            & (~month_due["Household ID"].astype(str).isin(scheduled_hids))
-        ].copy()
-
-        st.markdown("### Due this month but not scheduled")
-        if unscheduled.empty:
-            st.success("Everyone currently due this month is already on a saved week.")
-        else:
-            display_cols = [
-                c for c in [
-                    "Owner", "Dogs", "Area", "Groomer", "Due Date", "Status",
-                    "Minutes", "Price",
-                ]
-                if c in unscheduled.columns
+        show_projection = projected_unscheduled[
+            [
+                "Projected Due",
+                "Owner",
+                "Dogs",
+                "Area",
+                "Groomer",
+                "Minutes",
+                "Price",
             ]
-            if "Due Date" in unscheduled.columns:
-                unscheduled["Due Date"] = pd.to_datetime(
-                    unscheduled["Due Date"], errors="coerce"
-                ).dt.date
-            st.dataframe(
-                unscheduled[display_cols].sort_values("Due Date"),
-                hide_index=True,
-                use_container_width=True,
-            )
+        ].sort_values(
+            ["Projected Due", "Area", "Owner"]
+        )
+
+        st.dataframe(
+            show_projection,
+            hide_index=True,
+            use_container_width=True,
+            column_config={
+                "Price": st.column_config.NumberColumn(
+                    "Price",
+                    format="$%.0f",
+                ),
+                "Minutes": st.column_config.NumberColumn(
+                    "Minutes",
+                    format="%d",
+                ),
+            },
+        )
 
     st.markdown("### Jump to a week")
-    first_monday = month_start - pd.Timedelta(days=month_start.weekday())
+
+    first_monday = (
+        month_start - pd.Timedelta(days=month_start.weekday())
+    )
+    last_week_monday = (
+        month_end - pd.Timedelta(days=month_end.weekday())
+    )
+
     week_choices = []
     cursor = first_monday
-    while cursor <= month_end:
+    while cursor <= last_week_monday:
         week_choices.append(cursor.date())
         cursor += pd.Timedelta(days=7)
 
     chosen_week = st.selectbox(
         "Week",
         week_choices,
-        format_func=lambda d: f"Week of {pd.Timestamp(d):%b %d}",
-        key="monthly_week_jump",
+        format_func=lambda d: (
+            f"Week of {pd.Timestamp(d):%b %d}"
+        ),
+        key=f"monthly_week_jump_{month_start:%Y_%m}",
     )
 
-    if st.button("Set Weekly Route Builder to this week"):
+    if st.button(
+        "Open this week in Weekly Route Builder",
+        key=f"monthly_open_week_{month_start:%Y_%m}",
+    ):
         st.session_state["week_builder_date"] = chosen_week
         st.success(
             f"Weekly Route Builder is set to the week of "
-            f"{pd.Timestamp(chosen_week):%B %d}. Tap the Weekly Route Builder tab."
+            f"{pd.Timestamp(chosen_week):%B %d}. "
+            "Tap the Weekly Route Builder tab."
         )
 
 
