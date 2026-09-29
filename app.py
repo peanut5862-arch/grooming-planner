@@ -15,12 +15,12 @@ except Exception:
     create_client = None
 
 st.set_page_config(
-    page_title="Mobile Grooming Planner v12.7",
+    page_title="Mobile Grooming Planner v12.8",
     page_icon="🐾",
     layout="wide",
 )
 
-st.title("🐾 Mobile Grooming Planner v12.7")
+st.title("🐾 Mobile Grooming Planner v12.8")
 st.caption("Private client manager + due-date intelligence + cancellation filling + optional real drive-time scoring.")
 
 WORKDAYS = {
@@ -1156,23 +1156,73 @@ def get_supabase():
     )
 
 def clean_scalar(value):
-    if pd.isna(value):
+    if value is None:
         return None
+
+    # Streamlit's data editor can return blank cells as empty strings.
+    # PostgreSQL date/numeric columns need NULL instead of "".
+    if isinstance(value, str):
+        value = value.strip()
+        if value == "":
+            return None
+        return value
+
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+
     if isinstance(value, pd.Timestamp):
         return value.date().isoformat()
-    if isinstance(value, (date, datetime)):
+
+    if isinstance(value, datetime):
         return value.date().isoformat()
+
+    if isinstance(value, date):
+        return value.isoformat()
+
     if hasattr(value, "item"):
         try:
             return value.item()
         except Exception:
             pass
+
     return value
+
+
+def clean_db_field(db_col, value):
+    value = clean_scalar(value)
+
+    if value is None:
+        return None
+
+    if db_col in {"last_groom", "last_contacted"}:
+        parsed = pd.to_datetime(value, errors="coerce")
+        if pd.isna(parsed):
+            return None
+        return parsed.date().isoformat()
+
+    if db_col in {
+        "frequency_weeks",
+        "price",
+        "minutes",
+        "household_override_minutes",
+        "latitude",
+        "longitude",
+    }:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    return value
+
 
 def dog_row_to_db(row):
     payload = {}
     for app_col, db_col in APP_TO_DB_DOG.items():
-        payload[db_col] = clean_scalar(row.get(app_col))
+        payload[db_col] = clean_db_field(db_col, row.get(app_col))
     return payload
 
 def dogs_db_to_app(rows):
