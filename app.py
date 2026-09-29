@@ -15,12 +15,12 @@ except Exception:
     create_client = None
 
 st.set_page_config(
-    page_title="Mobile Grooming Planner v18.3",
+    page_title="Mobile Grooming Planner v18.4",
     page_icon="🐾",
     layout="wide",
 )
 
-st.title("🐾 Mobile Grooming Planner v18.3")
+st.title("🐾 Mobile Grooming Planner v18.4")
 st.caption("Private client manager + due-date intelligence + cancellation filling + optional real drive-time scoring.")
 
 WORKDAYS = {
@@ -1781,6 +1781,10 @@ def month_plan_dataframe(month_start, month_end):
         if plan is None or plan.empty:
             continue
 
+        # Session plans must obey the same confirmed-only rule as database rows.
+        if st.session_state.get("week_plan_statuses", {}).get(week_key) != "confirmed":
+            continue
+
         week_ts = pd.to_datetime(week_key, errors="coerce")
         if pd.isna(week_ts):
             continue
@@ -1887,74 +1891,105 @@ def confirmed_service_history(up_to_date, lookback_days=1095):
     Return the latest confirmed Bath/Groom appointment date by
     (household_id, dog_name, service).
 
-    This lets future projections restart from appointments that were actually
-    confirmed in the planner instead of relying only on stale Last Bath /
-    Last Groom fields in the client record.
+    Uses BOTH:
+    - confirmed rows persisted in Supabase
+    - confirmed weekly plans in the current Streamlit session
+
+    This guarantees future projections use the exact same confirmed schedule
+    the Monthly Planner is showing.
     """
     history = {}
-
-    if not supabase_configured():
-        return history
-
     up_to = pd.Timestamp(up_to_date).normalize()
-    query_start = (up_to - pd.Timedelta(days=lookback_days)).date().isoformat()
-    query_end = up_to.date().isoformat()
+    query_start_ts = up_to - pd.Timedelta(days=lookback_days)
 
-    try:
-        rows = (
-            get_supabase()
-            .table("weekly_drafts")
-            .select("week_start,plan_json,status")
-            .gte("week_start", query_start)
-            .lte("week_start", query_end)
-            .eq("status", "confirmed")
-            .execute()
-            .data
-            or []
-        )
-    except Exception:
-        return history
+    saved_weeks = []
+
+    if supabase_configured():
+        try:
+            db_rows = (
+                get_supabase()
+                .table("weekly_drafts")
+                .select("week_start,plan_json,status")
+                .gte("week_start", query_start_ts.date().isoformat())
+                .lte("week_start", up_to.date().isoformat())
+                .eq("status", "confirmed")
+                .execute()
+                .data
+                or []
+            )
+            saved_weeks.extend(db_rows)
+        except Exception:
+            pass
+
+    # Merge confirmed plans currently in session. These are allowed to replace
+    # the same DB week because they are what the user is actually seeing now.
+    session_confirmed = {}
+    statuses = st.session_state.get("week_plan_statuses", {})
+    for week_key, plan in st.session_state.get("week_route_plans", {}).items():
+        if statuses.get(week_key) != "confirmed":
+            continue
+        if plan is None or plan.empty:
+            continue
+
+        week_ts = pd.to_datetime(week_key, errors="coerce")
+        if pd.isna(week_ts):
+            continue
+        week_ts = week_ts.normalize()
+        if week_ts < query_start_ts or week_ts > up_to:
+            continue
+
+        session_confirmed[str(week_key)] = {
+            "week_start": str(week_key),
+            "status": "confirmed",
+            "plan_json": [row.to_dict() for _, row in plan.iterrows()],
+        }
+
+    # Keep one copy per week, preferring the current session version.
+    by_week = {
+        str(saved.get("week_start", "")): saved
+        for saved in saved_weeks
+        if str(saved.get("week_start", "")).strip()
+    }
+    by_week.update(session_confirmed)
 
     label_re = re.compile(r"^\s*(.*?)\s*\((Bath|Groom)\)\s*$", re.IGNORECASE)
 
-    for saved in rows:
+    def apply_item(item):
+        hid = str(item.get("Household ID", "") or "").strip()
+        raw_date = item.get("Date")
+        dogs_text = str(item.get("Dogs", "") or "").strip()
+
+        if not hid or not raw_date or not dogs_text:
+            return
+
+        appt_date = pd.to_datetime(raw_date, errors="coerce")
+        if pd.isna(appt_date):
+            return
+        appt_date = appt_date.normalize()
+
+        for label in [part.strip() for part in dogs_text.split(",") if part.strip()]:
+            match = label_re.match(label)
+            if not match:
+                continue
+
+            dog_name = match.group(1).strip()
+            service = match.group(2).title()
+            key = (hid, dog_name.casefold(), service)
+
+            prior = history.get(key)
+            if prior is None or appt_date > prior:
+                history[key] = appt_date
+
+            # Full groom includes a bath.
+            if service == "Groom":
+                bath_key = (hid, dog_name.casefold(), "Bath")
+                prior_bath = history.get(bath_key)
+                if prior_bath is None or appt_date > prior_bath:
+                    history[bath_key] = appt_date
+
+    for saved in by_week.values():
         for item in saved.get("plan_json") or []:
-            hid = str(item.get("Household ID", "") or "").strip()
-            raw_date = item.get("Date")
-            dogs_text = str(item.get("Dogs", "") or "").strip()
-
-            if not hid or not raw_date or not dogs_text:
-                continue
-
-            appt_date = pd.to_datetime(raw_date, errors="coerce")
-            if pd.isna(appt_date):
-                continue
-            appt_date = appt_date.normalize()
-
-            # Weekly plan stores household dogs like:
-            # "Lulu (Bath)" or "Dood 1 (Groom), Dood 2 (Groom)".
-            for label in [part.strip() for part in dogs_text.split(",") if part.strip()]:
-                match = label_re.match(label)
-                if not match:
-                    continue
-
-                dog_name = match.group(1).strip()
-                service = match.group(2).title()
-                key = (hid, dog_name.casefold(), service)
-
-                prior = history.get(key)
-                if prior is None or appt_date > prior:
-                    history[key] = appt_date
-
-                # A full groom includes a bath. So when a confirmed Groom is
-                # completed, it must also reset that dog's Bath clock.
-                # Otherwise an old Last Bath date can incorrectly project a bath
-                # only 1-2 weeks after the dog was just fully groomed.
-                if service == "Groom":
-                    bath_key = (hid, dog_name.casefold(), "Bath")
-                    prior_bath = history.get(bath_key)
-                    if prior_bath is None or appt_date > prior_bath:
-                        history[bath_key] = appt_date
+            apply_item(item)
 
     return history
 
@@ -3068,7 +3103,8 @@ with monthly_tab:
     st.markdown("### Projected / unscheduled this month")
     st.caption(
         "These are expected from the recurring service schedules, but they are "
-        "not appointments yet. Build the appropriate week to actually schedule them."
+        "not appointments yet. Confirmed appointments are used as the new recurrence "
+        "starting point before this list is calculated."
     )
 
     if projected_unscheduled.empty:
