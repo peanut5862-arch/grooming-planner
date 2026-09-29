@@ -15,12 +15,12 @@ except Exception:
     create_client = None
 
 st.set_page_config(
-    page_title="Mobile Grooming Planner v20.1",
+    page_title="Mobile Grooming Planner v20.2",
     page_icon="🐾",
     layout="wide",
 )
 
-st.title("🐾 Mobile Grooming Planner v20.1")
+st.title("🐾 Mobile Grooming Planner v20.2")
 st.caption("Private client manager + due-date intelligence + cancellation filling + optional real drive-time scoring.")
 
 WORKDAYS = {
@@ -3793,6 +3793,17 @@ with weekly_tab:
         "stored in the private database. It will not rebuild unless you tap "
         "Generate / rebuild week or Reset this week."
     )
+    # Cross-week rescheduling cannot directly change a widget key after that
+    # widget has already been created in the same Streamlit run. Store the
+    # requested destination temporarily, then apply it here on the next rerun
+    # BEFORE the date_input is instantiated.
+    pending_week_builder_date = st.session_state.pop(
+        "pending_week_builder_date",
+        None,
+    )
+    if pending_week_builder_date is not None:
+        st.session_state["week_builder_date"] = pending_week_builder_date
+
     week_start_input = st.date_input(
         "Week of",
         value=st.session_state.get("week_builder_date", date.today()),
@@ -4368,13 +4379,13 @@ with weekly_tab:
                                 "Review and confirm this week again."
                             )
                         else:
-                            st.session_state["week_builder_date"] = pd.Timestamp(
+                            st.session_state["pending_week_builder_date"] = pd.Timestamp(
                                 result["target_week_key"]
                             ).date()
                             st.success(
                                 f"Moved to {pd.Timestamp(new_date):%A, %b %d}. "
                                 f"The week of {pd.Timestamp(result['target_week_key']):%b %d} "
-                                "is now a Draft. Open that week, review it, and confirm it."
+                                "is now a Draft and will open next so you can review it."
                             )
 
                     else:
