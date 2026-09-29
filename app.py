@@ -15,12 +15,12 @@ except Exception:
     create_client = None
 
 st.set_page_config(
-    page_title="Mobile Grooming Planner v14.1",
+    page_title="Mobile Grooming Planner v14.2",
     page_icon="🐾",
     layout="wide",
 )
 
-st.title("🐾 Mobile Grooming Planner v14.1")
+st.title("🐾 Mobile Grooming Planner v14.2")
 st.caption("Private client manager + due-date intelligence + cancellation filling + optional real drive-time scoring.")
 
 WORKDAYS = {
@@ -39,6 +39,10 @@ CLIENT_COLUMNS = [
     "Frequency Weeks",
     "Service Pattern",
     "Next Service",
+    "Bath Frequency Weeks",
+    "Last Bath",
+    "Groom Frequency Weeks",
+    "Last Groom Service",
     "Bath Price",
     "Bath Minutes",
     "Groom Price",
@@ -209,11 +213,14 @@ def normalize_clients(df):
 
     df = df[keep_columns]
 
-    for c in ["Last Groom", "Last Contacted"]:
-        df[c] = pd.to_datetime(df[c], errors="coerce")
+    for c in ["Last Groom", "Last Contacted", "Last Bath", "Last Groom Service"]:
+        if c in df.columns:
+            df[c] = pd.to_datetime(df[c], errors="coerce")
 
     for c in [
         "Frequency Weeks",
+        "Bath Frequency Weeks",
+        "Groom Frequency Weeks",
         "Bath Price",
         "Bath Minutes",
         "Groom Price",
@@ -538,36 +545,93 @@ def score_candidates(
 
 # ---------- Service helpers ----------
 
-def effective_service_for_dog(row):
-    """
-    Decide which service this dog should receive on the next visit.
-    Supported patterns:
-      - Groom only
-      - Bath only
-      - Alternate: Groom/Bath
-    """
-    pattern = str(row.get("Service Pattern", "") or "").strip()
-    next_service = str(row.get("Next Service", "") or "").strip()
+def _safe_weeks(value):
+    try:
+        if pd.isna(value):
+            return None
+        value = int(value)
+        return value if value > 0 else None
+    except Exception:
+        return None
 
-    if pattern == "Bath only":
-        return "Bath"
-    if pattern == "Groom only":
+
+def _safe_date(value):
+    try:
+        if value is None or pd.isna(value):
+            return None
+        return pd.Timestamp(value)
+    except Exception:
+        return None
+
+
+def service_due_dates(row):
+    """
+    Return calendar due dates for Bath and Groom independently.
+    This means a dog can be bath every 4 weeks and groom every 8 weeks,
+    instead of merely flipping back and forth after each appointment.
+    """
+    bath_weeks = _safe_weeks(row.get("Bath Frequency Weeks"))
+    groom_weeks = _safe_weeks(row.get("Groom Frequency Weeks"))
+
+    last_bath = _safe_date(row.get("Last Bath"))
+    last_groom = _safe_date(row.get("Last Groom Service"))
+
+    # Backward compatibility: existing Last Groom can seed groom history.
+    if last_groom is None:
+        last_groom = _safe_date(row.get("Last Groom"))
+
+    bath_due = None
+    groom_due = None
+
+    if bath_weeks and last_bath is not None:
+        bath_due = last_bath + pd.Timedelta(weeks=bath_weeks)
+
+    if groom_weeks and last_groom is not None:
+        groom_due = last_groom + pd.Timedelta(weeks=groom_weeks)
+
+    return bath_due, groom_due
+
+
+def effective_service_for_dog(row, target_date=None):
+    """
+    Choose the service that is next due by calendar schedule.
+    If only one service has a cadence, use that service.
+    """
+    target = pd.Timestamp(target_date or date.today())
+    bath_due, groom_due = service_due_dates(row)
+
+    if bath_due is None and groom_due is None:
+        # Backward compatibility with v14 manual Next Service behavior.
+        next_service = str(row.get("Next Service", "") or "").strip()
+        if next_service in {"Bath", "Groom"}:
+            return next_service
+        pattern = str(row.get("Service Pattern", "") or "").strip()
+        if pattern == "Bath only":
+            return "Bath"
         return "Groom"
-    if pattern == "Alternate: Groom/Bath":
-        return next_service if next_service in {"Bath", "Groom"} else "Groom"
 
-    # Backward compatibility for older records.
-    if next_service in {"Bath", "Groom"}:
-        return next_service
-    return "Groom"
+    if bath_due is None:
+        return "Groom"
+    if groom_due is None:
+        return "Bath"
+
+    # Pick whichever service is due first.
+    # If both are due the same day, Groom wins because it is the fuller service.
+    if groom_due <= bath_due:
+        return "Groom"
+    return "Bath"
 
 
-def service_price_minutes(row):
-    """
-    Return (service_name, price, minutes) for the next scheduled service.
-    Falls back to legacy Price/Minutes values for older records.
-    """
+def next_service_due_date(row):
     service = effective_service_for_dog(row)
+    bath_due, groom_due = service_due_dates(row)
+    if service == "Bath":
+        return bath_due
+    return groom_due
+
+
+def service_price_minutes(row, target_date=None):
+    service = effective_service_for_dog(row, target_date=target_date)
 
     if service == "Bath":
         price = row.get("Bath Price")
@@ -584,33 +648,13 @@ def service_price_minutes(row):
     return service, price, minutes
 
 
-def advance_next_service_db(record_ids):
-    """
-    After a completed appointment, toggle Alternate dogs to their other service.
-    Groom-only and Bath-only dogs stay unchanged.
-    """
-    if not record_ids or not supabase_configured():
-        return
+def service_status_for_dog(row, target_date):
+    due_date = next_service_due_date(row)
+    if due_date is None:
+        return None, None
 
-    sb = get_supabase()
-
-    for record_id in record_ids:
-        response = sb.table("dogs").select(
-            "service_pattern,next_service"
-        ).eq("id", str(record_id)).limit(1).execute()
-
-        rows = response.data or []
-        if not rows:
-            continue
-
-        row = rows[0]
-        if row.get("service_pattern") == "Alternate: Groom/Bath":
-            current = row.get("next_service") or "Groom"
-            new_value = "Bath" if current == "Groom" else "Groom"
-            sb.table("dogs").update(
-                {"next_service": new_value}
-            ).eq("id", str(record_id)).execute()
-
+    days_until = (pd.Timestamp(due_date).normalize() - pd.Timestamp(target_date).normalize()).days
+    return due_date, days_until
 
 # ---------- Household / dog-level helpers ----------
 
@@ -651,15 +695,29 @@ def household_due_table(dog_df, target_date):
         dog_service_labels = []
         for _, dog_row in group.iterrows():
             dog_name = str(dog_row.get("Dog", "") or "").strip()
-            service_name = effective_service_for_dog(dog_row)
+            service_name = effective_service_for_dog(dog_row, target_date=target_date)
             if dog_name:
                 dog_service_labels.append(f"{dog_name} ({service_name})")
         dogs = ", ".join(dog_service_labels)
         area = str(group["Area"].dropna().iloc[0]) if group["Area"].notna().any() else ""
         groomer = str(group["Groomer"].dropna().iloc[0]) if group["Groomer"].notna().any() else ""
 
-        # Household is considered due by the most urgent dog.
-        days_until_due = group["Days Until Due"].min() if group["Days Until Due"].notna().any() else None
+        # Household is due by the earliest upcoming service across its dogs.
+        service_days = []
+        for _, dog_row in group.iterrows():
+            _, service_days_until = service_status_for_dog(dog_row, target_date)
+            if service_days_until is not None:
+                service_days.append(service_days_until)
+
+        if service_days:
+            days_until_due = min(service_days)
+        else:
+            # Fall back to the older single-frequency logic for legacy records.
+            days_until_due = (
+                group["Days Until Due"].min()
+                if group["Days Until Due"].notna().any()
+                else None
+            )
 
         if pd.isna(days_until_due):
             status = "Unknown"
@@ -674,7 +732,7 @@ def household_due_table(dog_df, target_date):
 
         service_values = group.apply(
             lambda row: pd.Series(
-                service_price_minutes(row),
+                service_price_minutes(row, target_date=target_date),
                 index=["Effective Service", "Effective Price", "Effective Minutes"],
             ),
             axis=1,
@@ -731,6 +789,10 @@ def household_member_detail(dog_df, household_id):
             "Dog",
             "Service Pattern",
             "Next Service",
+            "Bath Frequency Weeks",
+            "Last Bath",
+            "Groom Frequency Weeks",
+            "Last Groom Service",
             "Bath Minutes",
             "Bath Price",
             "Groom Minutes",
@@ -1188,6 +1250,10 @@ APP_TO_DB_DOG = {
     "Frequency Weeks": "frequency_weeks",
     "Service Pattern": "service_pattern",
     "Next Service": "next_service",
+    "Bath Frequency Weeks": "bath_frequency_weeks",
+    "Last Bath": "last_bath",
+    "Groom Frequency Weeks": "groom_frequency_weeks",
+    "Last Groom Service": "last_groom_service",
     "Bath Price": "bath_price",
     "Bath Minutes": "bath_minutes",
     "Groom Price": "groom_price",
@@ -1330,7 +1396,7 @@ def clean_db_field(db_col, value):
     if value is None:
         return None
 
-    if db_col in {"last_groom", "last_contacted"}:
+    if db_col in {"last_groom", "last_contacted", "last_bath", "last_groom_service"}:
         parsed = pd.to_datetime(value, errors="coerce")
         if pd.isna(parsed):
             return None
@@ -1338,6 +1404,8 @@ def clean_db_field(db_col, value):
 
     if db_col in {
         "frequency_weeks",
+        "bath_frequency_weeks",
+        "groom_frequency_weeks",
         "bath_price",
         "bath_minutes",
         "groom_price",
@@ -2274,38 +2342,48 @@ with clients_tab:
                     key=f"new_dog_last_groom_{dog_number}",
                 )
 
-            d3, d4 = st.columns(2)
-            with d3:
-                dog_frequency = st.selectbox(
-                    "Frequency",
-                    [2, 3, 4, 5, 6, 8, 10, 12],
-                    index=2,
-                    format_func=lambda x: f"{x} weeks",
-                    key=f"new_dog_frequency_{dog_number}",
+            st.caption("Set Bath and Groom on their own schedules.")
+
+            c1, c2 = st.columns(2)
+            with c1:
+                bath_frequency = st.selectbox(
+                    "Bath every",
+                    [0, 2, 3, 4, 5, 6, 8, 10, 12],
+                    index=0,
+                    format_func=lambda x: "Not scheduled" if x == 0 else f"{x} weeks",
+                    key=f"new_dog_bath_frequency_{dog_number}",
                 )
-            with d4:
-                service_pattern = st.selectbox(
-                    "Service pattern",
-                    ["Groom only", "Bath only", "Alternate: Groom/Bath"],
-                    key=f"new_dog_service_pattern_{dog_number}",
-                    help=(
-                        "Alternate means the dog's visits switch between a full groom "
-                        "and a bath."
-                    ),
+            with c2:
+                groom_frequency = st.selectbox(
+                    "Groom every",
+                    [0, 2, 3, 4, 5, 6, 8, 10, 12],
+                    index=4,
+                    format_func=lambda x: "Not scheduled" if x == 0 else f"{x} weeks",
+                    key=f"new_dog_groom_frequency_{dog_number}",
                 )
 
-            if service_pattern == "Alternate: Groom/Bath":
-                next_service = st.selectbox(
-                    "Next visit service",
-                    ["Groom", "Bath"],
-                    key=f"new_dog_next_service_{dog_number}",
+            c3, c4 = st.columns(2)
+            with c3:
+                last_bath = st.date_input(
+                    "Last bath",
+                    value=dog_last_groom,
+                    key=f"new_dog_last_bath_{dog_number}",
                 )
-            elif service_pattern == "Bath only":
-                next_service = "Bath"
-                st.caption("Next visit: Bath")
+            with c4:
+                last_groom_service = st.date_input(
+                    "Last full groom",
+                    value=dog_last_groom,
+                    key=f"new_dog_last_groom_service_{dog_number}",
+                )
+
+            if bath_frequency and groom_frequency:
+                service_pattern = "Scheduled Bath + Groom"
+            elif bath_frequency:
+                service_pattern = "Bath only"
             else:
-                next_service = "Groom"
-                st.caption("Next visit: Groom")
+                service_pattern = "Groom only"
+
+            next_service = "Groom"
 
             b1, b2 = st.columns(2)
             with b1:
@@ -2349,6 +2427,10 @@ with clients_tab:
                 "Frequency Weeks": dog_frequency,
                 "Service Pattern": service_pattern,
                 "Next Service": next_service,
+                "Bath Frequency Weeks": bath_frequency if bath_frequency > 0 else None,
+                "Last Bath": last_bath if bath_frequency > 0 else None,
+                "Groom Frequency Weeks": groom_frequency if groom_frequency > 0 else None,
+                "Last Groom Service": last_groom_service if groom_frequency > 0 else None,
                 "Bath Price": bath_price if bath_price > 0 else None,
                 "Bath Minutes": bath_minutes if bath_minutes > 0 else None,
                 "Groom Price": groom_price if groom_price > 0 else None,
@@ -2366,17 +2448,20 @@ with clients_tab:
 
             missing_service_details = []
             for i, dog in enumerate(dog_entries):
-                pattern = dog["Service Pattern"]
-                if pattern in {"Bath only", "Alternate: Groom/Bath"}:
+                if dog["Bath Frequency Weeks"]:
                     if not dog["Bath Price"] or not dog["Bath Minutes"]:
                         missing_service_details.append(
                             f"Dog {i + 1}: bath price/time"
                         )
-                if pattern in {"Groom only", "Alternate: Groom/Bath"}:
+                if dog["Groom Frequency Weeks"]:
                     if not dog["Groom Price"] or not dog["Groom Minutes"]:
                         missing_service_details.append(
                             f"Dog {i + 1}: groom price/time"
                         )
+                if not dog["Bath Frequency Weeks"] and not dog["Groom Frequency Weeks"]:
+                    missing_service_details.append(
+                        f"Dog {i + 1}: choose a bath or groom schedule"
+                    )
 
             if not new_owner.strip():
                 st.error("Owner name is required.")
@@ -2415,22 +2500,25 @@ with clients_tab:
                         "Frequency Weeks": dog["Frequency Weeks"],
                         "Service Pattern": dog["Service Pattern"],
                         "Next Service": dog["Next Service"],
+                        "Bath Frequency Weeks": dog["Bath Frequency Weeks"],
+                        "Last Bath": (
+                            pd.Timestamp(dog["Last Bath"])
+                            if dog["Last Bath"] is not None
+                            else pd.NaT
+                        ),
+                        "Groom Frequency Weeks": dog["Groom Frequency Weeks"],
+                        "Last Groom Service": (
+                            pd.Timestamp(dog["Last Groom Service"])
+                            if dog["Last Groom Service"] is not None
+                            else pd.NaT
+                        ),
                         "Bath Price": dog["Bath Price"],
                         "Bath Minutes": dog["Bath Minutes"],
                         "Groom Price": dog["Groom Price"],
                         "Groom Minutes": dog["Groom Minutes"],
-                        # Legacy fields mirror the next service so older planner paths
-                        # remain compatible while v14 transitions fully to service-aware data.
-                        "Price": (
-                            dog["Bath Price"]
-                            if dog["Next Service"] == "Bath"
-                            else dog["Groom Price"]
-                        ),
-                        "Minutes": (
-                            dog["Bath Minutes"]
-                            if dog["Next Service"] == "Bath"
-                            else dog["Groom Minutes"]
-                        ),
+                        # Legacy fields remain populated for backward compatibility.
+                        "Price": dog["Groom Price"] or dog["Bath Price"],
+                        "Minutes": dog["Groom Minutes"] or dog["Bath Minutes"],
                         "Household Override Minutes": (
                             household_override if household_override > 0 else None
                         ),
@@ -2568,33 +2656,88 @@ with clients_tab:
                 value=last_groom_value,
             )
 
-            pattern_options = ["Groom only", "Bath only", "Alternate: Groom/Bath"]
-            current_pattern = str(selected_row.get("Service Pattern", "") or "")
-            if current_pattern not in pattern_options:
-                current_pattern = "Groom only"
-
-            edit_pattern = st.selectbox(
-                "Service pattern",
-                pattern_options,
-                index=pattern_options.index(current_pattern),
+            st.markdown("##### Service schedule")
+            st.caption(
+                "Bath and full groom can each have their own recurring schedule."
             )
 
-            current_next = str(selected_row.get("Next Service", "") or "")
-            if edit_pattern == "Bath only":
-                edit_next_service = "Bath"
-                st.caption("Next visit: Bath")
-            elif edit_pattern == "Groom only":
-                edit_next_service = "Groom"
-                st.caption("Next visit: Groom")
-            else:
-                next_options = ["Groom", "Bath"]
-                if current_next not in next_options:
-                    current_next = "Groom"
-                edit_next_service = st.selectbox(
-                    "Next visit service",
-                    next_options,
-                    index=next_options.index(current_next),
+            def _int_or_zero(value):
+                try:
+                    if pd.isna(value):
+                        return 0
+                    return int(value)
+                except Exception:
+                    return 0
+
+            cadence_options = [0, 2, 3, 4, 5, 6, 8, 10, 12]
+
+            current_bath_freq = _int_or_zero(selected_row.get("Bath Frequency Weeks"))
+            current_groom_freq = _int_or_zero(selected_row.get("Groom Frequency Weeks"))
+
+            # Existing pre-v14.2 clients default their prior single cadence to groom.
+            if current_bath_freq == 0 and current_groom_freq == 0:
+                current_groom_freq = _int_or_zero(selected_row.get("Frequency Weeks")) or 4
+
+            f1, f2 = st.columns(2)
+            with f1:
+                edit_bath_frequency = st.selectbox(
+                    "Bath every",
+                    cadence_options,
+                    index=(
+                        cadence_options.index(current_bath_freq)
+                        if current_bath_freq in cadence_options
+                        else 0
+                    ),
+                    format_func=lambda x: "Not scheduled" if x == 0 else f"{x} weeks",
                 )
+            with f2:
+                edit_groom_frequency = st.selectbox(
+                    "Groom every",
+                    cadence_options,
+                    index=(
+                        cadence_options.index(current_groom_freq)
+                        if current_groom_freq in cadence_options
+                        else 0
+                    ),
+                    format_func=lambda x: "Not scheduled" if x == 0 else f"{x} weeks",
+                )
+
+            current_last_bath = selected_row.get("Last Bath")
+            if pd.isna(current_last_bath):
+                current_last_bath = selected_row.get("Last Groom")
+            current_last_groom_service = selected_row.get("Last Groom Service")
+            if pd.isna(current_last_groom_service):
+                current_last_groom_service = selected_row.get("Last Groom")
+
+            d1, d2 = st.columns(2)
+            with d1:
+                edit_last_bath = st.date_input(
+                    "Last bath",
+                    value=(
+                        pd.Timestamp(current_last_bath).date()
+                        if not pd.isna(current_last_bath)
+                        else date.today()
+                    ),
+                )
+            with d2:
+                edit_last_groom_service = st.date_input(
+                    "Last full groom",
+                    value=(
+                        pd.Timestamp(current_last_groom_service).date()
+                        if not pd.isna(current_last_groom_service)
+                        else date.today()
+                    ),
+                )
+
+            if edit_bath_frequency and edit_groom_frequency:
+                edit_pattern = "Scheduled Bath + Groom"
+            elif edit_bath_frequency:
+                edit_pattern = "Bath only"
+            else:
+                edit_pattern = "Groom only"
+
+            # Kept only for backward compatibility; calendar due dates drive the planner.
+            edit_next_service = "Groom"
 
             bp = selected_row.get("Bath Price")
             bm = selected_row.get("Bath Minutes")
@@ -2669,14 +2812,16 @@ with clients_tab:
 
                 if not edit_owner.strip() or not edit_dog.strip():
                     st.error("Owner name and dog name are required.")
-                elif edit_pattern in {"Bath only", "Alternate: Groom/Bath"} and (
+                elif edit_bath_frequency and (
                     edit_bath_price <= 0 or edit_bath_minutes <= 0
                 ):
                     st.error("Enter the bath price and bath time.")
-                elif edit_pattern in {"Groom only", "Alternate: Groom/Bath"} and (
+                elif edit_groom_frequency and (
                     edit_groom_price <= 0 or edit_groom_minutes <= 0
                 ):
                     st.error("Enter the full groom price and groom time.")
+                elif not edit_bath_frequency and not edit_groom_frequency:
+                    st.error("Choose at least one bath or groom schedule.")
                 else:
                     record_id = selected_row.get("Record ID")
 
@@ -2691,20 +2836,28 @@ with clients_tab:
                         "Frequency Weeks": edit_frequency,
                         "Service Pattern": edit_pattern,
                         "Next Service": edit_next_service,
+                        "Bath Frequency Weeks": (
+                            edit_bath_frequency if edit_bath_frequency > 0 else None
+                        ),
+                        "Last Bath": (
+                            pd.Timestamp(edit_last_bath)
+                            if edit_bath_frequency > 0
+                            else pd.NaT
+                        ),
+                        "Groom Frequency Weeks": (
+                            edit_groom_frequency if edit_groom_frequency > 0 else None
+                        ),
+                        "Last Groom Service": (
+                            pd.Timestamp(edit_last_groom_service)
+                            if edit_groom_frequency > 0
+                            else pd.NaT
+                        ),
                         "Bath Price": edit_bath_price if edit_bath_price > 0 else None,
                         "Bath Minutes": edit_bath_minutes if edit_bath_minutes > 0 else None,
                         "Groom Price": edit_groom_price if edit_groom_price > 0 else None,
                         "Groom Minutes": edit_groom_minutes if edit_groom_minutes > 0 else None,
-                        "Price": (
-                            edit_bath_price
-                            if edit_next_service == "Bath"
-                            else edit_groom_price
-                        ),
-                        "Minutes": (
-                            edit_bath_minutes
-                            if edit_next_service == "Bath"
-                            else edit_groom_minutes
-                        ),
+                        "Price": edit_groom_price or edit_bath_price,
+                        "Minutes": edit_groom_minutes or edit_bath_minutes,
                         "Household Override Minutes": selected_row.get(
                             "Household Override Minutes"
                         ),
@@ -2784,13 +2937,13 @@ with clients_tab:
         disabled=["Record ID"] if "Record ID" in editor_df.columns else [],
         column_config={
             "Frequency Weeks": st.column_config.NumberColumn("Frequency Weeks", min_value=1, step=1),
-            "Service Pattern": st.column_config.SelectboxColumn(
-                "Service Pattern",
-                options=["Groom only", "Bath only", "Alternate: Groom/Bath"],
+            "Service Pattern": st.column_config.TextColumn("Service Pattern"),
+            "Next Service": st.column_config.TextColumn("Next Service"),
+            "Bath Frequency Weeks": st.column_config.NumberColumn(
+                "Bath Frequency Weeks", min_value=0, step=1
             ),
-            "Next Service": st.column_config.SelectboxColumn(
-                "Next Service",
-                options=["Groom", "Bath"],
+            "Groom Frequency Weeks": st.column_config.NumberColumn(
+                "Groom Frequency Weeks", min_value=0, step=1
             ),
             "Bath Price": st.column_config.NumberColumn("Bath Price", format="$%.2f"),
             "Bath Minutes": st.column_config.NumberColumn("Bath Minutes", min_value=0, step=15),
