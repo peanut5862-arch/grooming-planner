@@ -15,12 +15,12 @@ except Exception:
     create_client = None
 
 st.set_page_config(
-    page_title="Mobile Grooming Planner v18.5",
+    page_title="Mobile Grooming Planner v19",
     page_icon="🐾",
     layout="wide",
 )
 
-st.title("🐾 Mobile Grooming Planner v18.5")
+st.title("🐾 Mobile Grooming Planner v19")
 st.caption("Private client manager + due-date intelligence + cancellation filling + optional real drive-time scoring.")
 
 WORKDAYS = {
@@ -926,6 +926,18 @@ def render_weekly_cards(valid_plan, daily_capacity, travel_buffer):
                 owner = str(row.get("Owner", "") or "").strip()
                 dogs = str(row.get("Dogs", "") or "").strip()
                 status = str(row.get("Status", "") or "").strip()
+                completion_status = str(
+                    row.get("Completion Status", "") or ""
+                ).strip()
+                completed_date = str(
+                    row.get("Completed Date", "") or ""
+                ).strip()
+                if completion_status == "Completed":
+                    status = (
+                        f"✅ Completed {completed_date}"
+                        if completed_date
+                        else "✅ Completed"
+                    )
                 start_time = str(row.get("Start Time", "") or "").strip()
                 end_time = str(row.get("End Time", "") or "").strip()
                 minutes = int(row.get("Minutes", 0) or 0)
@@ -1987,7 +1999,14 @@ def confirmed_service_history(up_to_date, lookback_days=1095):
 
     def apply_item(item):
         hid = str(item.get("Household ID", "") or "").strip()
-        raw_date = item.get("Date")
+        completion_status = str(
+            item.get("Completion Status", "") or ""
+        ).strip()
+        raw_date = (
+            item.get("Completed Date")
+            if completion_status == "Completed"
+            else item.get("Date")
+        )
         dogs_text = str(item.get("Dogs", "") or "").strip()
 
         if not hid or not raw_date or not dogs_text:
@@ -2303,6 +2322,132 @@ def dog_row_to_db(row):
     for app_col, db_col in APP_TO_DB_DOG.items():
         payload[db_col] = clean_db_field(db_col, row.get(app_col))
     return payload
+
+
+def parse_dog_service_labels(dogs_text):
+    """
+    Parse weekly-plan labels such as:
+      Lulu (Bath)
+      Dood 1 (Groom), Dood 2 (Groom)
+    Returns [(dog_name, service), ...].
+    """
+    matches = re.findall(
+        r"(?:^|,\s*)(.*?)\s*\((Bath|Groom)\)",
+        str(dogs_text or ""),
+        flags=re.IGNORECASE,
+    )
+    return [
+        (name.strip(), service.title())
+        for name, service in matches
+        if name.strip()
+    ]
+
+
+def mark_household_services_completed(household_id, dogs_text, completed_date):
+    """
+    Update the private dog records after a real appointment is completed.
+
+    Bath:
+      - updates Last Bath
+
+    Groom:
+      - updates Last Groom Service
+      - updates legacy Last Groom
+      - updates Last Bath too, because a full groom includes a bath
+    """
+    household_id = str(household_id or "").strip()
+    completed_ts = pd.Timestamp(completed_date).normalize()
+    completed_iso = completed_ts.date().isoformat()
+    services = parse_dog_service_labels(dogs_text)
+
+    if not household_id or not services:
+        return 0, []
+
+    updated = st.session_state.clients.copy()
+    changed = 0
+    missing = []
+
+    for dog_name, service in services:
+        mask = (
+            updated["Household ID"].astype(str).str.strip().eq(household_id)
+            & updated["Dog"].astype(str).str.strip().str.casefold().eq(
+                dog_name.casefold()
+            )
+        )
+        matching = updated[mask]
+
+        if matching.empty:
+            missing.append(dog_name)
+            continue
+
+        for row_index, row in matching.iterrows():
+            if service == "Bath":
+                updated.at[row_index, "Last Bath"] = completed_ts
+                db_updates = {
+                    "last_bath": completed_iso,
+                }
+            else:
+                updated.at[row_index, "Last Groom Service"] = completed_ts
+                updated.at[row_index, "Last Groom"] = completed_ts
+                updated.at[row_index, "Last Bath"] = completed_ts
+                db_updates = {
+                    "last_groom_service": completed_iso,
+                    "last_groom": completed_iso,
+                    "last_bath": completed_iso,
+                }
+
+            if supabase_configured():
+                record_id = row.get("Record ID")
+                if record_id and str(record_id).strip().lower() != "nan":
+                    (
+                        get_supabase()
+                        .table("dogs")
+                        .update(db_updates)
+                        .eq("id", str(record_id))
+                        .execute()
+                    )
+
+            changed += 1
+
+    st.session_state.clients = normalize_clients(updated)
+    return changed, missing
+
+
+def mark_week_plan_row_completed(
+    week_key,
+    plan,
+    row_index,
+    completed_date,
+    current_settings,
+):
+    """
+    Mark one weekly appointment completed and persist that status inside
+    weekly_drafts.plan_json. This does not move or rebuild the route.
+    """
+    updated_plan = plan.copy()
+
+    if "Completion Status" not in updated_plan.columns:
+        updated_plan["Completion Status"] = ""
+    if "Completed Date" not in updated_plan.columns:
+        updated_plan["Completed Date"] = ""
+
+    updated_plan.at[row_index, "Completion Status"] = "Completed"
+    updated_plan.at[row_index, "Completed Date"] = (
+        pd.Timestamp(completed_date).date().isoformat()
+    )
+
+    st.session_state.week_route_plans[week_key] = updated_plan
+
+    if supabase_configured():
+        save_week_draft_db(
+            week_key,
+            updated_plan,
+            current_settings,
+            st.session_state.week_plan_fingerprints.get(week_key, ""),
+        )
+
+    return updated_plan
+
 
 def dogs_db_to_app(rows):
     if not rows:
@@ -3151,6 +3296,9 @@ with monthly_tab:
                     groomer = str(row.get("Groomer", "") or "")
                     area = str(row.get("Area Cluster", "") or "")
                     price = float(row.get("Price", 0) or 0)
+                    completion_status = str(
+                        row.get("Completion Status", "") or ""
+                    ).strip()
 
                     details = " · ".join(
                         [part for part in [groomer, area] if part]
@@ -3160,10 +3308,16 @@ with monthly_tab:
                     )
                     dog_text = f" / {dogs}" if dogs else ""
 
+                    completed_text = (
+                        " · ✅ Completed"
+                        if completion_status == "Completed"
+                        else ""
+                    )
+
                     st.markdown(
                         f"- **{time_prefix}{owner}{dog_text}**"
                         f"{' · ' + details if details else ''} "
-                        f"· ${price:,.0f}"
+                        f"· ${price:,.0f}{completed_text}"
                     )
 
             st.divider()
@@ -3568,6 +3722,99 @@ with weekly_tab:
             daily_capacity=daily_capacity,
             travel_buffer=travel_buffer,
         )
+
+        st.markdown("### Complete an appointment")
+        st.caption(
+            "Use this after the service is actually finished. It updates each dog's "
+            "Last Bath / Last Groom date automatically so future scheduling starts "
+            "from what was really done."
+        )
+
+        completion_candidates = valid.copy()
+        if "Completion Status" in completion_candidates.columns:
+            completion_candidates = completion_candidates[
+                completion_candidates["Completion Status"].fillna("") != "Completed"
+            ].copy()
+
+        if completion_candidates.empty:
+            st.success("All appointments in this week are marked completed.")
+        else:
+            completion_options = {}
+            for row_index, row in completion_candidates.iterrows():
+                appt_date = pd.to_datetime(
+                    row.get("Date"),
+                    errors="coerce",
+                )
+                date_label = (
+                    appt_date.strftime("%a %b %d")
+                    if not pd.isna(appt_date)
+                    else str(row.get("Date", ""))
+                )
+                label = (
+                    f"{date_label} · {row.get('Start Time', '')} · "
+                    f"{row.get('Owner', '')} / {row.get('Dogs', '')}"
+                )
+                completion_options[label] = row_index
+
+            selected_completion = st.selectbox(
+                "Appointment",
+                list(completion_options.keys()),
+                key=f"complete_appointment_{week_key}",
+            )
+            completion_row_index = completion_options[selected_completion]
+            completion_row = valid.loc[completion_row_index]
+
+            default_completed_date = pd.to_datetime(
+                completion_row.get("Date"),
+                errors="coerce",
+            )
+            if pd.isna(default_completed_date):
+                default_completed_date = pd.Timestamp(date.today())
+
+            completion_date = st.date_input(
+                "Date service was completed",
+                value=default_completed_date.date(),
+                key=f"completed_date_{week_key}_{completion_row_index}",
+            )
+
+            if st.button(
+                "✅ Mark appointment completed",
+                type="primary",
+                key=f"mark_completed_{week_key}",
+            ):
+                try:
+                    changed, missing = mark_household_services_completed(
+                        completion_row.get("Household ID"),
+                        completion_row.get("Dogs"),
+                        completion_date,
+                    )
+
+                    weekly_plan = mark_week_plan_row_completed(
+                        week_key,
+                        st.session_state.week_route_plans[week_key],
+                        completion_row_index,
+                        completion_date,
+                        current_settings,
+                    )
+
+                    if missing:
+                        st.warning(
+                            "Appointment was marked completed, but I could not match "
+                            f"these dog name(s) to the client records: {', '.join(missing)}."
+                        )
+                    elif changed:
+                        st.success(
+                            f"Completed. Updated {changed} dog record(s) and their "
+                            "future recurrence dates."
+                        )
+                    else:
+                        st.warning(
+                            "Appointment was marked completed, but no dog records were updated."
+                        )
+
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Could not mark this appointment completed: {exc}")
 
         st.markdown("### Add a client to this week")
         st.caption(
