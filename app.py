@@ -15,12 +15,12 @@ except Exception:
     create_client = None
 
 st.set_page_config(
-    page_title="Mobile Grooming Planner v12.8",
+    page_title="Mobile Grooming Planner v12.9",
     page_icon="🐾",
     layout="wide",
 )
 
-st.title("🐾 Mobile Grooming Planner v12.8")
+st.title("🐾 Mobile Grooming Planner v12.9")
 st.caption("Private client manager + due-date intelligence + cancellation filling + optional real drive-time scoring.")
 
 WORKDAYS = {
@@ -194,7 +194,14 @@ def normalize_clients(df):
     df["Household ID"] = df["Household ID"].fillna(df["Owner"])
     df.loc[df["Household ID"].astype(str).str.strip() == "", "Household ID"] = df["Owner"]
 
-    df = df[CLIENT_COLUMNS]
+    # Preserve the database primary key when rows came from Supabase.
+    # Without this, "Save dog edits" cannot update existing rows and would
+    # insert a new copy instead.
+    keep_columns = CLIENT_COLUMNS.copy()
+    if "Record ID" in df.columns:
+        keep_columns.append("Record ID")
+
+    df = df[keep_columns]
 
     for c in ["Last Groom", "Last Contacted"]:
         df[c] = pd.to_datetime(df[c], errors="coerce")
@@ -1280,6 +1287,43 @@ def delete_dog_ids_db(ids):
     for record_id in ids:
         sb.table("dogs").delete().eq("id", str(record_id)).execute()
 
+def remove_exact_duplicate_dogs_db():
+    """
+    Keep the oldest copy of truly identical dog records and remove only
+    exact duplicates. Database IDs/timestamps are ignored when comparing.
+    """
+    sb = get_supabase()
+    response = (
+        sb.table("dogs")
+        .select("*")
+        .order("created_at")
+        .execute()
+    )
+    rows = response.data or []
+
+    compare_fields = list(APP_TO_DB_DOG.values())
+    seen = set()
+    duplicate_ids = []
+
+    def canonical(value):
+        if value is None:
+            return None
+        if isinstance(value, str):
+            return value.strip()
+        return value
+
+    for row in rows:
+        signature = tuple(canonical(row.get(field)) for field in compare_fields)
+
+        if signature in seen:
+            if row.get("id"):
+                duplicate_ids.append(str(row["id"]))
+        else:
+            seen.add(signature)
+
+    delete_dog_ids_db(duplicate_ids)
+    return len(duplicate_ids)
+
 def appointments_db_to_app(rows):
     if not rows:
         return normalize_appointments(pd.DataFrame(columns=APPT_COLUMNS))
@@ -2154,6 +2198,25 @@ with clients_tab:
                     st.rerun()
 
     st.markdown("### Edit dogs")
+
+    if supabase_configured() and not st.session_state.clients.empty:
+        if st.button(
+            "Remove exact duplicate dogs",
+            help=(
+                "Keeps one copy and removes only database rows whose client/dog "
+                "details are exactly identical."
+            ),
+        ):
+            try:
+                removed = remove_exact_duplicate_dogs_db()
+                st.session_state.clients = load_dogs_from_db()
+                if removed:
+                    st.success(f"Removed {removed} exact duplicate record(s).")
+                else:
+                    st.info("No exact duplicate records found.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Duplicate cleanup failed: {exc}")
 
     editor_df = clients_for_download(st.session_state.clients).copy()
 
