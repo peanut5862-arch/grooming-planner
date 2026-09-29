@@ -16,12 +16,12 @@ except Exception:
     create_client = None
 
 st.set_page_config(
-    page_title="Mobile Grooming Planner v24.1",
+    page_title="Mobile Grooming Planner v24.2",
     page_icon="🐾",
     layout="wide",
 )
 
-st.title("🐾 Mobile Grooming Planner v24.1")
+st.title("🐾 Mobile Grooming Planner v24.2")
 st.caption("Private client manager + due-date intelligence + weekly routing + real Google Maps drive-time optimization.")
 
 WORKDAYS = {
@@ -740,38 +740,41 @@ def optimize_week_with_google_maps(
                 locked_times[row_index] = lock_minutes
 
         if routable:
-            (
-                best_order,
-                timed_schedule,
-                timed_score,
-            ) = _best_timed_route_order(
-                routable,
-                pair_metrics,
-                start_metrics,
-                end_metrics,
-                durations,
-                locked_times,
-                first_arrival_time,
-                service_buffer_minutes=service_buffer_minutes,
-                has_home=home_coord is not None,
-            )
-
-            if best_order is None:
-                locked_names = [
-                    str(optimized.at[idx, "Owner"] or "client")
-                    for idx in routable
-                    if idx in locked_times
-                ]
-                raise ValueError(
-                    f"{groomer} on {pd.Timestamp(day_date):%A %b %d} "
-                    "cannot meet the exact appointment time(s) with the current "
-                    "clients and drive times"
-                    + (
-                        f": {', '.join(locked_names)}."
-                        if locked_names
-                        else "."
-                    )
+            if locked_times:
+                (
+                    best_order,
+                    timed_schedule,
+                    timed_score,
+                ) = _best_timed_route_order(
+                    routable,
+                    pair_metrics,
+                    start_metrics,
+                    end_metrics,
+                    durations,
+                    locked_times,
+                    first_arrival_time,
+                    service_buffer_minutes=service_buffer_minutes,
+                    has_home=home_coord is not None,
                 )
+
+                if best_order is None:
+                    locked_names = [
+                        str(optimized.at[idx, "Owner"] or "client")
+                        for idx in routable
+                        if idx in locked_times
+                    ]
+                    raise ValueError(
+                        f"{groomer} on {pd.Timestamp(day_date):%A %b %d} "
+                        "cannot meet the locked appointment time(s) with the "
+                        "current clients and drive times: "
+                        + ", ".join(locked_names)
+                    )
+            else:
+                # No exact-time promises on this day: use the normal route
+                # optimizer. A flaky/missing pairwise Routes response elsewhere
+                # in the week must not block saving an exact time on another day.
+                best_order = list(_distance_order)
+                timed_schedule = {}
         else:
             best_order = []
             timed_schedule = {}
@@ -814,7 +817,8 @@ def optimize_week_with_google_maps(
                 start_t = minutes_to_time(start_minutes)
                 end_t = minutes_to_time(end_minutes)
             else:
-                # Unroutable fallback rows retain ordinary sequential timing.
+                # Normal flexible timing. First stop begins at the configured
+                # first-stop arrival time; later stops add actual drive time.
                 if previous_idx is not None:
                     current_time = add_minutes_to_time(
                         current_time,
@@ -5668,8 +5672,8 @@ with weekly_tab:
                     st.rerun()
                 except Exception as exc:
                     st.error(
-                        "That exact time cannot fit the current route. "
-                        f"Try a different time or move another appointment. Details: {exc}"
+                        "The route could not be rebuilt with the current time "
+                        f"locks. Details: {exc}"
                     )
 
         st.markdown("### Complete an appointment")
@@ -7297,6 +7301,6 @@ with export_tab:
         st.code('GOOGLE_MAPS_API_KEY = "your-key-here"')
 
 st.caption(
-    "Mobile Grooming Planner v24.1 · private Supabase data · recurring service schedules · "
+    "Mobile Grooming Planner v24.2 · private Supabase data · recurring service schedules · "
     "weekly/monthly planning · completion tracking · optional Google Maps routing."
 )
