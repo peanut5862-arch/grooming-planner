@@ -15,12 +15,12 @@ except Exception:
     create_client = None
 
 st.set_page_config(
-    page_title="Mobile Grooming Planner v15.1",
+    page_title="Mobile Grooming Planner v15.2",
     page_icon="🐾",
     layout="wide",
 )
 
-st.title("🐾 Mobile Grooming Planner v15.1")
+st.title("🐾 Mobile Grooming Planner v15.2")
 st.caption("Private client manager + due-date intelligence + cancellation filling + optional real drive-time scoring.")
 
 WORKDAYS = {
@@ -1131,13 +1131,33 @@ def build_week_plan(
             else:
                 preferred_area = choose_area_for_day(groomer_pool)
 
-            area_pool = groomer_pool[
+            same_area_pool = groomer_pool[
                 groomer_pool["Area"].astype(str).str.strip().str.lower()
                 == str(preferred_area).strip().lower()
             ].copy()
 
-            # Book urgent clients first. Clients not due yet can still fill
-            # otherwise-open capacity, but only after overdue/due-soon clients.
+            # This-week day moves are hard constraints. Keep every client who was
+            # explicitly moved to this day even when their saved Area label differs
+            # from the day's primary cluster. Then fill remaining capacity from the
+            # primary area. This avoids dropping nearby clients just because two
+            # neighborhoods have different text labels.
+            forced_today = groomer_pool[
+                groomer_pool["_Requested Day"] == day_name
+            ].copy()
+
+            forced_ids = set(
+                forced_today["Household ID"].astype(str).tolist()
+            )
+            same_area_fill = same_area_pool[
+                ~same_area_pool["Household ID"].astype(str).isin(forced_ids)
+            ].copy()
+
+            area_pool = pd.concat(
+                [forced_today, same_area_fill],
+                ignore_index=False,
+            ).drop_duplicates(subset=["Household ID"], keep="first")
+
+            # Book urgent clients first, but explicit this-week moves stay first.
             area_pool["_Urgency Tier"] = area_pool["Days Until Due"].apply(
                 lambda d: (
                     0 if pd.notna(d) and d < 0
@@ -1194,7 +1214,15 @@ def build_week_plan(
                         "Date": day_date,
                         "Day": day_name,
                         "Groomer": groomer,
-                        "Area Cluster": preferred_area or row["Area"],
+                        "Area Cluster": (
+                            "Mixed · this-week moves"
+                            if len({
+                                str(x).strip().lower()
+                                for x in forced_today["Area"].dropna().tolist()
+                                if str(x).strip()
+                            }) > 1
+                            else (preferred_area or row["Area"])
+                        ),
                         "Owner": row["Owner"],
                         "Dogs": row["Dogs"],
                         "Status": row["Status"],
@@ -2399,7 +2427,8 @@ with weekly_tab:
         st.markdown("### Client replies / this-week changes")
         st.caption(
             "Use this after you text clients. A day change only affects this selected week; "
-            "it does not change the client's normal recurring schedule."
+            "it does not change the client's normal recurring schedule. Clients you manually "
+            "move to a day are kept on that day even if their saved Area labels differ."
         )
 
         due_households = household_due_table(
