@@ -15,12 +15,12 @@ except Exception:
     create_client = None
 
 st.set_page_config(
-    page_title="Mobile Grooming Planner v16.1",
+    page_title="Mobile Grooming Planner v17",
     page_icon="🐾",
     layout="wide",
 )
 
-st.title("🐾 Mobile Grooming Planner v16.1")
+st.title("🐾 Mobile Grooming Planner v17")
 st.caption("Private client manager + due-date intelligence + cancellation filling + optional real drive-time scoring.")
 
 WORKDAYS = {
@@ -1644,7 +1644,7 @@ def load_week_draft_db(week_key):
         rows = (
             get_supabase()
             .table("weekly_drafts")
-            .select("plan_json,settings_json,client_fingerprint")
+            .select("plan_json,settings_json,client_fingerprint,status,confirmed_at")
             .eq("week_start", str(week_key))
             .limit(1)
             .execute()
@@ -1677,6 +1677,8 @@ def load_week_draft_db(week_key):
             "plan": plan,
             "settings": settings,
             "fingerprint": saved.get("client_fingerprint") or "",
+            "status": saved.get("status") or "draft",
+            "confirmed_at": saved.get("confirmed_at"),
         }
     except Exception:
         return None
@@ -1688,6 +1690,30 @@ def delete_week_draft_db(week_key):
     get_supabase().table("weekly_drafts").delete().eq(
         "week_start", str(week_key)
     ).execute()
+
+
+def set_week_draft_status_db(week_key, status):
+    """Mark a saved weekly draft as draft or confirmed."""
+    if not supabase_configured():
+        return
+
+    payload = {
+        "status": str(status),
+        "confirmed_at": (
+            datetime.utcnow().isoformat()
+            if str(status) == "confirmed"
+            else None
+        ),
+        "updated_at": datetime.utcnow().isoformat(),
+    }
+
+    (
+        get_supabase()
+        .table("weekly_drafts")
+        .update(payload)
+        .eq("week_start", str(week_key))
+        .execute()
+    )
 
 
 def load_month_drafts_db(month_start, month_end):
@@ -1708,9 +1734,10 @@ def load_month_drafts_db(month_start, month_end):
         return (
             get_supabase()
             .table("weekly_drafts")
-            .select("week_start,plan_json")
+            .select("week_start,plan_json,status,confirmed_at")
             .gte("week_start", query_start)
             .lte("week_start", query_end)
+            .eq("status", "confirmed")
             .order("week_start")
             .execute()
             .data
@@ -2522,6 +2549,8 @@ if "week_builder_settings" not in st.session_state:
     st.session_state.week_builder_settings = {}
 if "week_plan_fingerprints" not in st.session_state:
     st.session_state.week_plan_fingerprints = {}
+if "week_plan_statuses" not in st.session_state:
+    st.session_state.week_plan_statuses = {}
 
 def schedule_data_fingerprint(df):
     if df is None or df.empty:
@@ -2548,9 +2577,12 @@ def schedule_data_fingerprint(df):
 
 with monthly_tab:
     st.markdown("## Monthly planner")
+    st.info(
+        "Only confirmed weeks count as your real schedule here. Old test drafts stay hidden."
+    )
     st.caption(
-        "See the whole month at once. Each displayed week is the exact saved Weekly "
-        "Route Builder draft, including spillover weekdays from the month before or after."
+        "See the whole month at once. This page shows CONFIRMED weekly schedules only, "
+        "including spillover weekdays from the month before or after."
     )
 
     month_pick = st.date_input(
@@ -2567,8 +2599,8 @@ with monthly_tab:
 
     if month_plan.empty:
         st.info(
-            "No saved appointments are on this month yet. Build a week in Weekly Route "
-            "Builder and it will appear here automatically."
+            "No confirmed appointments are on this month yet. Build and adjust a week in "
+            "Weekly Route Builder, then tap Confirm this week."
         )
     else:
         month_dates = pd.to_datetime(month_plan["Date"], errors="coerce")
@@ -2795,6 +2827,7 @@ with weekly_tab:
             st.session_state.week_route_plans[week_key] = persisted_draft["plan"]
             st.session_state.week_builder_settings[week_key] = persisted_draft["settings"]
             st.session_state.week_plan_fingerprints[week_key] = persisted_draft["fingerprint"]
+            st.session_state.week_plan_statuses[week_key] = persisted_draft.get("status", "draft")
 
     default_settings = {
         "daily_capacity": 420,
@@ -2913,6 +2946,7 @@ with weekly_tab:
         ):
             st.session_state.week_route_plans.pop(week_key, None)
             st.session_state.week_plan_fingerprints.pop(week_key, None)
+            st.session_state.week_plan_statuses.pop(week_key, None)
             st.session_state.week_client_responses[week_key] = {}
             try:
                 clear_week_overrides_db(week_key)
@@ -2930,6 +2964,53 @@ with weekly_tab:
             ]:
                 st.session_state.pop(key, None)
             st.rerun()
+
+    current_status = st.session_state.week_plan_statuses.get(
+        week_key,
+        "draft",
+    )
+
+    if current_status == "confirmed":
+        st.success("This week is CONFIRMED and will appear on the Monthly Planner.")
+    else:
+        st.info(
+            "This week is a DRAFT. It will not appear on the Monthly Planner until you confirm it."
+        )
+
+    confirm_col1, confirm_col2 = st.columns(2)
+
+    with confirm_col1:
+        if current_status != "confirmed":
+            if st.button(
+                "Confirm this week",
+                type="primary",
+                key=f"confirm_week_{week_key}",
+            ):
+                if week_key not in st.session_state.week_route_plans:
+                    st.warning("Generate the week first, then confirm it.")
+                else:
+                    try:
+                        set_week_draft_status_db(week_key, "confirmed")
+                        st.session_state.week_plan_statuses[week_key] = "confirmed"
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Could not confirm this week: {exc}")
+        else:
+            if st.button(
+                "Return to draft",
+                key=f"unconfirm_week_{week_key}",
+            ):
+                try:
+                    set_week_draft_status_db(week_key, "draft")
+                    st.session_state.week_plan_statuses[week_key] = "draft"
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Could not return this week to draft: {exc}")
+
+    with confirm_col2:
+        st.caption(
+            "Monthly Planner shows confirmed weeks only. You can keep editing a draft until it is ready."
+        )
 
     current_fingerprint = schedule_data_fingerprint(st.session_state.clients)
 
@@ -2955,6 +3036,7 @@ with weekly_tab:
 
         st.session_state.week_route_plans[week_key] = weekly_plan
         st.session_state.week_plan_fingerprints[week_key] = current_fingerprint
+        st.session_state.week_plan_statuses[week_key] = "draft"
         try:
             save_week_draft_db(
                 week_key,
@@ -2962,6 +3044,7 @@ with weekly_tab:
                 current_settings,
                 current_fingerprint,
             )
+            set_week_draft_status_db(week_key, "draft")
         except Exception as exc:
             st.error(
                 "The week was generated, but it could not be saved permanently: "
@@ -3096,6 +3179,7 @@ with weekly_tab:
                     service_buffer_minutes=service_buffer,
                 )
                 st.session_state.week_route_plans[week_key] = adjusted_plan
+                st.session_state.week_plan_statuses[week_key] = "draft"
                 st.session_state.week_plan_fingerprints[week_key] = current_fingerprint
                 try:
                     save_week_draft_db(
@@ -3104,6 +3188,7 @@ with weekly_tab:
                         current_settings,
                         current_fingerprint,
                     )
+                    set_week_draft_status_db(week_key, "draft")
                 except Exception as exc:
                     st.error(
                         "The move was applied on screen, but the weekly draft "
@@ -3210,6 +3295,7 @@ with weekly_tab:
                         service_buffer_minutes=service_buffer,
                     )
                     st.session_state.week_route_plans[week_key] = adjusted_plan
+                    st.session_state.week_plan_statuses[week_key] = "draft"
                     adjusted_fingerprint = schedule_data_fingerprint(
                         st.session_state.clients
                     )
@@ -3221,6 +3307,7 @@ with weekly_tab:
                             current_settings,
                             adjusted_fingerprint,
                         )
+                        set_week_draft_status_db(week_key, "draft")
                     except Exception as exc:
                         st.error(
                             "The move was applied on screen, but the weekly draft "
@@ -3251,6 +3338,7 @@ with weekly_tab:
                         service_buffer_minutes=service_buffer,
                     )
                     st.session_state.week_route_plans[week_key] = cleared_plan
+                    st.session_state.week_plan_statuses[week_key] = "draft"
                     cleared_fingerprint = schedule_data_fingerprint(
                         st.session_state.clients
                     )
@@ -3262,6 +3350,7 @@ with weekly_tab:
                             current_settings,
                             cleared_fingerprint,
                         )
+                        set_week_draft_status_db(week_key, "draft")
                     except Exception as exc:
                         st.error(
                             "The changes were cleared on screen, but the weekly draft "
