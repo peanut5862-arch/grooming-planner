@@ -15,12 +15,12 @@ except Exception:
     create_client = None
 
 st.set_page_config(
-    page_title="Mobile Grooming Planner v15.7",
+    page_title="Mobile Grooming Planner v15.8",
     page_icon="🐾",
     layout="wide",
 )
 
-st.title("🐾 Mobile Grooming Planner v15.7")
+st.title("🐾 Mobile Grooming Planner v15.8")
 st.caption("Private client manager + due-date intelligence + cancellation filling + optional real drive-time scoring.")
 
 WORKDAYS = {
@@ -2431,13 +2431,6 @@ with weekly_tab:
         "stored in the private database. It will not rebuild unless you tap "
         "Generate / rebuild week or Reset this week."
     )
-    if already_scheduled_households:
-        st.caption(
-            f"{len(already_scheduled_households)} household(s) already placed in a "
-            "recent saved week are being kept out of this week's automatic draft. "
-            "You can still manually add one if you intentionally need to reschedule them."
-        )
-
     week_start_input = st.date_input(
         "Week of",
         value=st.session_state.get("week_builder_date", date.today()),
@@ -2453,6 +2446,13 @@ with weekly_tab:
         week_key,
         lookback_weeks=4,
     )
+
+    if already_scheduled_households:
+        st.caption(
+            f"{len(already_scheduled_households)} household(s) already placed in a "
+            "recent saved week are being kept out of this week's automatic draft. "
+            "You can still manually add one if you intentionally need to reschedule them."
+        )
 
     if week_key not in st.session_state.week_client_responses:
         st.session_state.week_client_responses[week_key] = load_week_overrides_db(week_key)
