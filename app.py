@@ -16,12 +16,12 @@ except Exception:
     create_client = None
 
 st.set_page_config(
-    page_title="Mobile Grooming Planner v23",
+    page_title="Mobile Grooming Planner v23.1",
     page_icon="🐾",
     layout="wide",
 )
 
-st.title("🐾 Mobile Grooming Planner v23")
+st.title("🐾 Mobile Grooming Planner v23.1")
 st.caption("Private client manager + due-date intelligence + weekly routing + real Google Maps drive-time optimization.")
 
 WORKDAYS = {
@@ -433,6 +433,7 @@ def optimize_week_with_google_maps(
         ("Drive From Previous Miles", 0.0),
         ("Drive Home After Min", 0.0),
         ("Drive Home After Miles", 0.0),
+        ("Leave Home Time", ""),
         ("Routing Mode", ""),
     ]:
         if col not in optimized.columns:
@@ -523,13 +524,17 @@ def optimize_week_with_google_maps(
         # silently dropping it.
         final_order = list(best_order) + list(unroutable)
 
-        current_time = jen_start if groomer == "Jen" else haley_start
+        # The configured groomer time is ARRIVAL AT THE FIRST CLIENT,
+        # not the time they leave home.
+        first_arrival_time = jen_start if groomer == "Jen" else haley_start
+        current_time = first_arrival_time
         previous_idx = None
 
-        # Clear old return-home values for this groomer/day.
+        # Clear old routing values for this groomer/day.
         for row_index in group.index:
             optimized.at[row_index, "Drive Home After Min"] = 0.0
             optimized.at[row_index, "Drive Home After Miles"] = 0.0
+            optimized.at[row_index, "Leave Home Time"] = ""
 
         for position, row_index in enumerate(final_order, start=1):
             drive_miles = 0.0
@@ -539,15 +544,25 @@ def optimize_week_with_google_maps(
                 metric = start_metrics.get(row_index)
                 if metric is not None:
                     drive_miles, drive_minutes = metric
+
+                # First appointment remains exactly at the configured arrival
+                # time. Work backwards to show when the groomer should leave home.
+                optimized.at[row_index, "Leave Home Time"] = format_clock(
+                    add_minutes_to_time(
+                        first_arrival_time,
+                        -int(round(drive_minutes)),
+                    )
+                )
             elif previous_idx is not None:
                 metric = pair_metrics.get((previous_idx, row_index))
                 if metric is not None:
                     drive_miles, drive_minutes = metric
 
-            current_time = add_minutes_to_time(
-                current_time,
-                int(round(drive_minutes)),
-            )
+                # Between clients, travel happens after the prior appointment.
+                current_time = add_minutes_to_time(
+                    current_time,
+                    int(round(drive_minutes)),
+                )
 
             duration = pd.to_numeric(
                 optimized.at[row_index, "Minutes"],
@@ -1573,9 +1588,27 @@ def render_weekly_cards(valid_plan, daily_capacity, travel_buffer):
                     if home_mode
                     else "between client stops"
                 )
+                leave_home_values = (
+                    groomer_group.get(
+                        "Leave Home Time",
+                        pd.Series([""] * len(groomer_group), index=groomer_group.index),
+                    )
+                    .fillna("")
+                    .astype(str)
+                )
+                leave_home_values = [
+                    value for value in leave_home_values.tolist() if value.strip()
+                ]
+                leave_home_text = (
+                    f" · leave home {leave_home_values[0]}"
+                    if leave_home_values
+                    else ""
+                )
+
                 st.caption(
                     f"{groomer}: {travel_total} drive min · "
-                    f"{drive_miles:.1f} mi · {route_scope} · "
+                    f"{drive_miles:.1f} mi · {route_scope}"
+                    f"{leave_home_text} · "
                     f"{open_minutes} open min remaining"
                 )
             else:
@@ -4904,14 +4937,14 @@ with weekly_tab:
 
     with t1:
         jen_start = st.time_input(
-            "Jen start time",
+            "Jen first-stop arrival time",
             value=saved_settings.get("jen_start", time(8, 0)),
             key=f"jen_week_start_{week_key}",
         )
 
     with t2:
         haley_start = st.time_input(
-            "Haley start time",
+            "Haley first-stop arrival time",
             value=saved_settings.get("haley_start", time(8, 0)),
             key=f"haley_week_start_{week_key}",
         )
@@ -5131,8 +5164,10 @@ with weekly_tab:
                     st.success(
                         "Route optimized using Google Maps drive times. "
                         "When a groomer's private home address is configured, "
-                        "the route now includes home → clients → home. "
-                        "Review it, then confirm the week again."
+                        "the route includes home → clients → home. The groomer start "
+                        "time is the ARRIVAL time at the first client; the app works "
+                        "backward to determine when to leave home. Review it, then "
+                        "confirm the week again."
                     )
                     st.rerun()
 
@@ -6815,6 +6850,6 @@ with export_tab:
         st.code('GOOGLE_MAPS_API_KEY = "your-key-here"')
 
 st.caption(
-    "Mobile Grooming Planner v23 · private Supabase data · recurring service schedules · "
+    "Mobile Grooming Planner v23.1 · private Supabase data · recurring service schedules · "
     "weekly/monthly planning · completion tracking · optional Google Maps routing."
 )
