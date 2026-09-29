@@ -18,7 +18,7 @@ except Exception:
     create_client = None
 
 st.set_page_config(
-    page_title="Mobile Grooming Planner v27",
+    page_title="Mobile Grooming Planner v28",
     page_icon="🐾",
     layout="wide",
 )
@@ -4931,7 +4931,7 @@ if "appointments" not in st.session_state:
 
 # ---------- Sidebar: private data ----------
 
-st.sidebar.caption("Grooming Planner · v27")
+st.sidebar.caption("Grooming Planner · v28")
 st.sidebar.header("Private data")
 
 if supabase_configured():
@@ -5167,7 +5167,7 @@ with today_tab:
             "There is no saved weekly schedule containing this day yet."
         )
         if st.button(
-            "Open this week in Weekly Route Builder",
+            "Open selected week",
             key=f"today_open_empty_week_{today_week_key}",
         ):
             st.session_state["week_builder_date"] = pd.Timestamp(
@@ -5824,6 +5824,277 @@ def schedule_data_fingerprint(df):
 
 # ---------- Monthly Planner ----------
 
+
+def render_month_planner_board(
+    month_start,
+    month_end,
+    confirmed_rows,
+    projected_rows,
+):
+    """
+    Compact Monday-Friday wall-planner view.
+    Confirmed appointments and projected/unscheduled recurring work share one board.
+    """
+    month_start = pd.Timestamp(month_start).normalize()
+    month_end = pd.Timestamp(month_end).normalize()
+
+    confirmed = confirmed_rows.copy() if confirmed_rows is not None else pd.DataFrame()
+    projected = projected_rows.copy() if projected_rows is not None else pd.DataFrame()
+
+    if not confirmed.empty:
+        confirmed["_Planner Date"] = pd.to_datetime(
+            confirmed.get("Date"),
+            errors="coerce",
+        ).dt.normalize()
+
+    if not projected.empty:
+        projected["_Planner Date"] = pd.to_datetime(
+            projected.get("Projected Due"),
+            errors="coerce",
+        ).dt.normalize()
+
+    first_monday = month_start - pd.Timedelta(days=month_start.weekday())
+    last_monday = month_end - pd.Timedelta(days=month_end.weekday())
+
+    css = """
+    <style>
+      .gp-month-wrap{
+        overflow-x:auto;
+        padding:.15rem 0 .45rem 0;
+        margin:.15rem 0 .8rem 0;
+      }
+      .gp-month-board{
+        min-width:900px;
+        display:flex;
+        flex-direction:column;
+        gap:.5rem;
+      }
+      .gp-month-week{
+        display:grid;
+        grid-template-columns:repeat(5,minmax(0,1fr));
+        gap:.42rem;
+      }
+      .gp-month-day{
+        background:#fff;
+        border:1px solid #E7E8EC;
+        border-radius:14px;
+        min-height:138px;
+        padding:.48rem;
+      }
+      .gp-month-day.outside{
+        background:#F3F1ED;
+        opacity:.62;
+      }
+      .gp-month-day.today{
+        border:2px solid #18243D;
+      }
+      .gp-month-head{
+        display:flex;
+        align-items:baseline;
+        justify-content:space-between;
+        gap:.3rem;
+        padding-bottom:.35rem;
+        border-bottom:1px solid #ECEDEF;
+        margin-bottom:.38rem;
+      }
+      .gp-month-dow{
+        font-size:.68rem;
+        text-transform:uppercase;
+        letter-spacing:.06em;
+        color:#6F7787;
+        font-weight:700;
+      }
+      .gp-month-date{
+        font-size:.86rem;
+        font-weight:780;
+        color:#18243D;
+      }
+      .gp-month-stop{
+        border-left:3px solid #18243D;
+        background:#F7F8FA;
+        border-radius:8px;
+        padding:.3rem .36rem;
+        margin:.28rem 0;
+        line-height:1.18;
+      }
+      .gp-month-stop.projected{
+        border-left-color:#A59B8A;
+        background:#F5F1E9;
+      }
+      .gp-month-stop.completed{
+        border-left-color:#5E7A64;
+        background:#EEF4EF;
+      }
+      .gp-month-time{
+        font-size:.64rem;
+        color:#6F7787;
+        font-weight:700;
+      }
+      .gp-month-client{
+        font-size:.73rem;
+        color:#1E2738;
+        font-weight:730;
+        margin-top:.08rem;
+      }
+      .gp-month-dogs{
+        font-size:.65rem;
+        color:#6F7787;
+        margin-top:.06rem;
+      }
+      .gp-month-meta{
+        font-size:.61rem;
+        color:#7B8290;
+        margin-top:.12rem;
+      }
+      .gp-month-empty{
+        color:#A2A7B0;
+        font-size:.68rem;
+        padding:.25rem 0;
+      }
+      .gp-month-legend{
+        display:flex;
+        flex-wrap:wrap;
+        gap:.45rem .8rem;
+        color:#6F7787;
+        font-size:.68rem;
+        margin:.1rem 0 .45rem 0;
+      }
+      .gp-month-dot{
+        display:inline-block;
+        width:.48rem;
+        height:.48rem;
+        border-radius:999px;
+        margin-right:.24rem;
+        vertical-align:middle;
+      }
+      @media (max-width:700px){
+        .gp-month-board{min-width:790px;}
+        .gp-month-day{min-height:124px;padding:.4rem;}
+      }
+    </style>
+    """
+
+    today_value = pd.Timestamp(date.today()).normalize()
+
+    parts = [
+        css,
+        '<div class="gp-month-legend">'
+        '<span><span class="gp-month-dot" style="background:#18243D"></span>Scheduled</span>'
+        '<span><span class="gp-month-dot" style="background:#5E7A64"></span>Completed</span>'
+        '<span><span class="gp-month-dot" style="background:#A59B8A"></span>Projected / not scheduled</span>'
+        '</div>',
+        '<div class="gp-month-wrap"><div class="gp-month-board">',
+    ]
+
+    week_cursor = first_monday
+    while week_cursor <= last_monday:
+        parts.append('<div class="gp-month-week">')
+
+        for day_offset in range(5):
+            day_ts = (week_cursor + pd.Timedelta(days=day_offset)).normalize()
+            outside = day_ts.month != month_start.month
+            today_class = " today" if day_ts == today_value else ""
+            outside_class = " outside" if outside else ""
+
+            parts.append(
+                f'<div class="gp-month-day{outside_class}{today_class}">'
+                f'<div class="gp-month-head">'
+                f'<span class="gp-month-dow">{day_ts:%a}</span>'
+                f'<span class="gp-month-date">{day_ts:%b} {day_ts.day}</span>'
+                f'</div>'
+            )
+
+            day_has_items = False
+
+            if not confirmed.empty:
+                day_confirmed = confirmed[
+                    confirmed["_Planner Date"] == day_ts
+                ].copy()
+
+                if not day_confirmed.empty:
+                    day_confirmed["_Start Sort"] = day_confirmed.get(
+                        "Start Time",
+                        pd.Series([""] * len(day_confirmed), index=day_confirmed.index),
+                    ).apply(clock_sort_minutes)
+                    day_confirmed = day_confirmed.sort_values(
+                        ["_Start Sort", "Groomer", "Owner"],
+                        kind="stable",
+                    )
+
+                    for _, row in day_confirmed.iterrows():
+                        day_has_items = True
+                        start_time = str(row.get("Start Time", "") or "").strip()
+                        owner = html.escape(str(row.get("Owner", "") or "").strip())
+                        dogs = html.escape(str(row.get("Dogs", "") or "").strip())
+                        groomer = html.escape(str(row.get("Groomer", "") or "").strip())
+                        area = html.escape(str(row.get("Area Cluster", "") or "").strip())
+                        price = float(row.get("Price", 0) or 0)
+                        completion = str(
+                            row.get("Completion Status", "") or ""
+                        ).strip()
+                        completed_class = " completed" if completion == "Completed" else ""
+
+                        meta_bits = [bit for bit in [groomer, area] if bit]
+                        meta = " · ".join(meta_bits)
+                        if price:
+                            meta = (meta + " · " if meta else "") + f"${price:,.0f}"
+
+                        parts.append(
+                            f'<div class="gp-month-stop{completed_class}">'
+                            f'<div class="gp-month-time">{html.escape(start_time) if start_time else "Scheduled"}</div>'
+                            f'<div class="gp-month-client">{owner}</div>'
+                            f'<div class="gp-month-dogs">{dogs if dogs else "&nbsp;"}</div>'
+                            f'<div class="gp-month-meta">{meta}</div>'
+                            f'</div>'
+                        )
+
+            if not projected.empty and not outside:
+                day_projected = projected[
+                    projected["_Planner Date"] == day_ts
+                ].copy()
+
+                if not day_projected.empty:
+                    day_projected = day_projected.sort_values(
+                        ["Groomer", "Area", "Owner"],
+                        kind="stable",
+                    )
+
+                    for _, row in day_projected.iterrows():
+                        day_has_items = True
+                        owner = html.escape(str(row.get("Owner", "") or "").strip())
+                        dogs = html.escape(str(row.get("Dogs", "") or "").strip())
+                        groomer = html.escape(str(row.get("Groomer", "") or "").strip())
+                        area = html.escape(str(row.get("Area", "") or "").strip())
+                        price = float(row.get("Price", 0) or 0)
+
+                        meta_bits = [bit for bit in [groomer, area] if bit]
+                        meta = " · ".join(meta_bits)
+                        if price:
+                            meta = (meta + " · " if meta else "") + f"${price:,.0f}"
+
+                        parts.append(
+                            '<div class="gp-month-stop projected">'
+                            '<div class="gp-month-time">○ Due / projected</div>'
+                            f'<div class="gp-month-client">{owner}</div>'
+                            f'<div class="gp-month-dogs">{dogs if dogs else "&nbsp;"}</div>'
+                            f'<div class="gp-month-meta">{meta}</div>'
+                            '</div>'
+                        )
+
+            if not day_has_items:
+                parts.append('<div class="gp-month-empty">Open</div>')
+
+            parts.append('</div>')
+
+        parts.append('</div>')
+        week_cursor += pd.Timedelta(days=7)
+
+    parts.append('</div></div>')
+
+    st.markdown("".join(parts), unsafe_allow_html=True)
+
+
+
 with monthly_tab:
     st.markdown("## Monthly planner")
     st.caption(
@@ -5968,205 +6239,85 @@ with monthly_tab:
         "Projections use each dog's recurring cadence. A confirmed full groom resets both the Groom and Bath clocks, because the groom includes the bath."
     )
 
-    st.markdown("### Confirmed schedule")
-
-    if month_plan.empty:
-        st.info(
-            "No confirmed appointments are on this month yet."
-        )
-
-        unconfirmed_weeks = load_month_unconfirmed_drafts_db(
-            month_start,
-            month_end,
-        )
-
-        if unconfirmed_weeks:
-            draft_labels = []
-            for saved in unconfirmed_weeks:
-                week_value = pd.to_datetime(
-                    saved.get("week_start"),
-                    errors="coerce",
-                )
-                if not pd.isna(week_value):
-                    draft_labels.append(f"{week_value:%b %d}")
-
-            label_text = ", ".join(draft_labels) if draft_labels else "this month"
-
-            st.warning(
-                f"You do have saved draft schedule(s) for: {label_text}. "
-                "They are hidden here until you open that week in Weekly Route Builder "
-                "and tap Confirm this week."
-            )
-        else:
-            st.caption(
-                "Build and adjust a week in Weekly Route Builder, then tap Confirm this week."
-            )
-    else:
-        month_plan["_Date Sort"] = pd.to_datetime(
-            month_plan["Date"],
-            errors="coerce",
-        )
-        monday_series = (
-            month_plan["_Date Sort"]
-            - pd.to_timedelta(
-                month_plan["_Date Sort"].dt.weekday,
-                unit="D",
-            )
-        )
-        month_plan["_Week Monday"] = monday_series.dt.date
-
-        for week_monday, week_group in month_plan.groupby(
-            "_Week Monday",
-            sort=True,
-        ):
-            week_monday_ts = pd.Timestamp(week_monday)
-            week_revenue = float(
-                week_group["Price"].sum()
-            ) if "Price" in week_group.columns else 0
-            week_count = len(week_group)
-
-            st.markdown(
-                f"#### Week of {week_monday_ts:%b %d} "
-                f"· {week_count} appts · ${week_revenue:,.0f}"
-            )
-
-            for day_offset in range(5):
-                day_ts = week_monday_ts + pd.Timedelta(days=day_offset)
-                day_rows = week_group[
-                    pd.to_datetime(week_group["Date"]).dt.normalize()
-                    == day_ts.normalize()
-                ].copy()
-
-                if day_rows.empty:
-                    st.markdown(
-                        f"**{day_ts:%A · %b %d}** — _open_"
-                    )
-                    continue
-
-                day_rows["_Start Sort"] = day_rows.get(
-                    "Start Time",
-                    pd.Series(
-                        [""] * len(day_rows),
-                        index=day_rows.index,
-                    ),
-                ).apply(clock_sort_minutes)
-
-                day_rows = day_rows.sort_values(
-                    ["_Start Sort", "Groomer", "Owner"],
-                    kind="stable",
-                )
-
-                day_revenue = float(
-                    day_rows["Price"].sum()
-                ) if "Price" in day_rows.columns else 0
-
-                st.markdown(
-                    f"**{day_ts:%A · %b %d}** "
-                    f"· {len(day_rows)} appts · ${day_revenue:,.0f}"
-                )
-
-                for _, row in day_rows.iterrows():
-                    start_time = str(row.get("Start Time", "") or "")
-                    owner = str(row.get("Owner", "") or "")
-                    dogs = str(row.get("Dogs", "") or "")
-                    groomer = str(row.get("Groomer", "") or "")
-                    area = str(row.get("Area Cluster", "") or "")
-                    price = float(row.get("Price", 0) or 0)
-                    completion_status = str(
-                        row.get("Completion Status", "") or ""
-                    ).strip()
-                    appointment_status = str(
-                        row.get("Appointment Status", "") or ""
-                    ).strip()
-                    status_note = str(
-                        row.get("Status Note", "") or ""
-                    ).strip()
-
-                    details = " · ".join(
-                        [part for part in [groomer, area] if part]
-                    )
-                    time_prefix = (
-                        f"{start_time} · " if start_time else ""
-                    )
-                    dog_text = f" / {dogs}" if dogs else ""
-
-                    if completion_status == "Completed":
-                        completed_text = " · ✅ Completed"
-                    elif appointment_status == "Cancelled":
-                        completed_text = " · ❌ Cancelled"
-                    elif appointment_status == "Rescheduled":
-                        completed_text = " · ↪️ Rescheduled"
-                    elif appointment_status == "Moved to another week":
-                        moved_to = str(row.get("Rescheduled To", "") or "").strip()
-                        completed_text = (
-                            f" · ↪️ Moved to {moved_to}"
-                            if moved_to
-                            else " · ↪️ Moved to another week"
-                        )
-                    else:
-                        completed_text = ""
-
-                    if status_note and appointment_status in {
-                        "Cancelled", "Rescheduled", "Moved to another week"
-                    }:
-                        completed_text += f" · {status_note}"
-
-                    st.markdown(
-                        f"- **{time_prefix}{owner}{dog_text}**"
-                        f"{' · ' + details if details else ''} "
-                        f"· ${price:,.0f}{completed_text}"
-                    )
-
-            st.divider()
-
-    st.markdown("### Projected / unscheduled this month")
+    st.markdown("### Month at a glance")
     st.caption(
-        "These are expected from the recurring service schedules, but they are "
-        "not appointments yet. For the current month, past due dates are hidden; "
-        "only today forward is projected. Confirmed appointments reset the recurrence clock."
+        "A workweek planner view. Swipe sideways on your phone to see Monday–Friday. "
+        "Scheduled appointments and projected recurring clients are shown together."
     )
 
-    if projected_unscheduled.empty:
-        st.success(
-            "No additional recurring clients are currently projected for this month."
-        )
-    else:
-        projected_unscheduled["Projected Due"] = pd.to_datetime(
-            projected_unscheduled["Projected Due"],
-            errors="coerce",
-        ).dt.date
+    render_month_planner_board(
+        month_start,
+        month_end,
+        month_active,
+        projected_unscheduled,
+    )
 
-        show_projection = projected_unscheduled[
-            [
-                "Projected Due",
-                "Owner",
-                "Dogs",
-                "Area",
-                "Groomer",
-                "Minutes",
-                "Price",
-            ]
-        ].sort_values(
-            ["Projected Due", "Area", "Owner"]
+    unconfirmed_weeks = load_month_unconfirmed_drafts_db(
+        month_start,
+        month_end,
+    )
+    if unconfirmed_weeks:
+        draft_labels = []
+        for saved in unconfirmed_weeks:
+            week_value = pd.to_datetime(
+                saved.get("week_start"),
+                errors="coerce",
+            )
+            if not pd.isna(week_value):
+                draft_labels.append(f"{week_value:%b %d}")
+        if draft_labels:
+            st.warning(
+                "Draft week(s) are not shown as scheduled yet: "
+                + ", ".join(draft_labels)
+                + ". Confirm those weeks to place them on the monthly planner."
+            )
+
+    with st.expander("Projected / unscheduled details", expanded=False):
+        st.caption(
+            "These are expected from recurring service schedules but are not appointments yet."
         )
 
-        st.dataframe(
-            show_projection,
-            hide_index=True,
-            use_container_width=True,
-            column_config={
-                "Price": st.column_config.NumberColumn(
-                    "Price",
-                    format="$%.0f",
-                ),
-                "Minutes": st.column_config.NumberColumn(
+        if projected_unscheduled.empty:
+            st.success(
+                "No additional recurring clients are currently projected for this month."
+            )
+        else:
+            projected_unscheduled["Projected Due"] = pd.to_datetime(
+                projected_unscheduled["Projected Due"],
+                errors="coerce",
+            ).dt.date
+
+            show_projection = projected_unscheduled[
+                [
+                    "Projected Due",
+                    "Owner",
+                    "Dogs",
+                    "Area",
+                    "Groomer",
                     "Minutes",
-                    format="%d",
-                ),
-            },
-        )
+                    "Price",
+                ]
+            ].sort_values(
+                ["Projected Due", "Area", "Owner"]
+            )
 
-    st.markdown("### Jump to a week")
+            st.dataframe(
+                show_projection,
+                hide_index=True,
+                use_container_width=True,
+                column_config={
+                    "Price": st.column_config.NumberColumn(
+                        "Price",
+                        format="$%.0f",
+                    ),
+                    "Minutes": st.column_config.NumberColumn(
+                        "Minutes",
+                        format="%d",
+                    ),
+                },
+            )
+
+    st.markdown("### Open a week")
 
     first_monday = (
         month_start - pd.Timedelta(days=month_start.weekday())
@@ -7950,6 +8101,6 @@ with export_tab:
         st.code('GOOGLE_MAPS_API_KEY = "your-key-here"')
 
 st.caption(
-    "Mobile Grooming Planner v27 · private Supabase data · recurring service schedules · "
+    "Mobile Grooming Planner v28 · private Supabase data · recurring service schedules · "
     "weekly/monthly planning · completion tracking · optional Google Maps routing."
 )
