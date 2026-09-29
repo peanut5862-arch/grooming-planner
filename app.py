@@ -18,7 +18,7 @@ except Exception:
     create_client = None
 
 st.set_page_config(
-    page_title="Mobile Grooming Planner v28",
+    page_title="Mobile Grooming Planner v29",
     page_icon="🐾",
     layout="wide",
 )
@@ -2554,7 +2554,165 @@ def render_inline_week_appointment_editor(
                     st.error(f"Could not save confirmation: {exc}")
 
 
-def render_weekly_cards(valid_plan, daily_capacity, travel_buffer, week_key=None, current_settings=None, maps_key=None):
+
+def render_inline_day_add(
+    day_name,
+    week_key,
+    week_start_input,
+    current_settings,
+    max_appointments,
+):
+    """Add a client/household directly to a selected day from the weekly planner."""
+    if not week_key or current_settings is None:
+        return
+
+    all_households = household_due_table(
+        st.session_state.clients,
+        pd.Timestamp(week_start_input),
+    )
+
+    if all_households.empty:
+        st.caption("No saved clients are available to add.")
+        return
+
+    current_plan = st.session_state.week_route_plans.get(
+        week_key,
+        pd.DataFrame(),
+    )
+    scheduled_hids = set()
+    if current_plan is not None and not current_plan.empty:
+        active_plan = current_plan.copy()
+        if "Appointment Status" in active_plan.columns:
+            active_plan = active_plan[
+                ~active_plan["Appointment Status"]
+                .fillna("Scheduled")
+                .isin(["Cancelled", "Moved to another week"])
+            ]
+        scheduled_hids = set(
+            active_plan.get("Household ID", pd.Series(dtype=str))
+            .fillna("")
+            .astype(str)
+            .tolist()
+        )
+
+    available = all_households[
+        ~all_households["Household ID"].astype(str).isin(scheduled_hids)
+    ].copy()
+
+    if available.empty:
+        st.caption("Every saved household is already on this week.")
+        return
+
+    options = {}
+    for _, row in available.sort_values(
+        ["Owner", "Dogs"],
+        kind="stable",
+    ).iterrows():
+        hid = str(row.get("Household ID", "") or "")
+        owner = str(row.get("Owner", "") or "").strip()
+        dogs = str(row.get("Dogs", "") or "").strip()
+        status = str(row.get("Status", "") or "").strip()
+        label = f"{owner} / {dogs}" if dogs else owner
+        if status:
+            label += f" · {status}"
+        options[label] = hid
+
+    selected_label = st.selectbox(
+        "Client / dogs",
+        list(options.keys()),
+        key=f"quick_add_client_{week_key}_{day_name}",
+    )
+    selected_hid = options[selected_label]
+    selected_row = available[
+        available["Household ID"].astype(str) == str(selected_hid)
+    ].iloc[0]
+
+    normal_groomer = str(selected_row.get("Groomer", "") or "")
+    if normal_groomer == "Jen":
+        groomer_choices = ["Jen"]
+    elif normal_groomer == "Haley":
+        groomer_choices = ["Haley"]
+    else:
+        groomer_choices = ["Jen", "Haley"]
+
+    valid_choices = [
+        g for g in groomer_choices
+        if day_name in WORKDAYS.get(g, [])
+    ]
+
+    if not valid_choices:
+        st.warning(f"No available groomer normally works on {day_name}.")
+        return
+
+    chosen_groomer = st.selectbox(
+        "Groomer",
+        valid_choices,
+        key=f"quick_add_groomer_{week_key}_{day_name}",
+    )
+
+    if st.button(
+        f"+ Add to {day_name}",
+        type="primary",
+        use_container_width=True,
+        key=f"quick_add_button_{week_key}_{day_name}",
+    ):
+        try:
+            if week_key not in st.session_state.week_client_responses:
+                st.session_state.week_client_responses[week_key] = (
+                    load_week_overrides_db(week_key)
+                )
+
+            week_overrides = st.session_state.week_client_responses[week_key]
+            week_overrides[selected_hid] = {
+                "response_status": "Manually added",
+                "requested_day": day_name,
+                "requested_groomer": chosen_groomer,
+                "force_include": True,
+            }
+            st.session_state.week_client_responses[week_key] = week_overrides
+
+            save_week_override_db(
+                week_key,
+                selected_hid,
+                week_overrides[selected_hid],
+            )
+
+            adjusted_plan = build_week_plan(
+                st.session_state.clients,
+                pd.Timestamp(week_start_input),
+                daily_capacity_minutes=current_settings["daily_capacity"],
+                max_appointments_per_day=max_appointments,
+                week_overrides=week_overrides,
+            )
+
+            adjusted_plan = assign_times_to_weekly_plan(
+                adjusted_plan,
+                jen_start=current_settings["jen_start"],
+                haley_start=current_settings["haley_start"],
+                travel_buffer_minutes=current_settings["travel_buffer"],
+                service_buffer_minutes=current_settings["service_buffer"],
+            )
+
+            st.session_state.week_route_plans[week_key] = adjusted_plan
+            st.session_state.week_plan_statuses[week_key] = "draft"
+            fingerprint = schedule_data_fingerprint(
+                st.session_state.clients
+            )
+            st.session_state.week_plan_fingerprints[week_key] = fingerprint
+
+            save_week_draft_db(
+                week_key,
+                adjusted_plan,
+                current_settings,
+                fingerprint,
+            )
+            set_week_draft_status_db(week_key, "draft")
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Could not add this client to {day_name}: {exc}")
+
+
+def render_weekly_cards(valid_plan, daily_capacity, travel_buffer, week_key=None, current_settings=None, maps_key=None, week_start_input=None, max_appointments=4):
     """Compact whole-week-at-a-glance view designed for phones."""
     if valid_plan.empty:
         st.info("No scheduled appointments for this week.")
@@ -2589,6 +2747,16 @@ def render_weekly_cards(valid_plan, daily_capacity, travel_buffer, week_key=None
             </div>""",
             unsafe_allow_html=True,
         )
+
+        if week_key and current_settings is not None and week_start_input is not None:
+            with st.expander(f"＋ Add dog/client to {day_name}", expanded=False):
+                render_inline_day_add(
+                    day_name,
+                    week_key,
+                    week_start_input,
+                    current_settings,
+                    max_appointments,
+                )
 
         for groomer, groomer_group in day_group.groupby("Groomer", sort=False):
             groomer_group = groomer_group.sort_values(
@@ -4931,7 +5099,7 @@ if "appointments" not in st.session_state:
 
 # ---------- Sidebar: private data ----------
 
-st.sidebar.caption("Grooming Planner · v28")
+st.sidebar.caption("Grooming Planner · v29")
 st.sidebar.header("Private data")
 
 if supabase_configured():
@@ -6750,7 +6918,7 @@ with weekly_tab:
         m3.metric("Scheduled minutes", int(active_valid["Minutes"].sum()))
 
         st.markdown("### Weekly schedule")
-        st.caption("Tap any client name to change time, reschedule, confirm, cancel, or complete.")
+        st.caption("Tap a client to edit it, or use ＋ Add dog/client directly under the day you want.")
         render_weekly_cards(
             valid,
             daily_capacity=daily_capacity,
@@ -6758,6 +6926,8 @@ with weekly_tab:
             week_key=week_key,
             current_settings=current_settings,
             maps_key=maps_key,
+            week_start_input=week_start_input,
+            max_appointments=max_appointments,
         )
 
         st.markdown("### More weekly tools")
@@ -6767,112 +6937,9 @@ with weekly_tab:
             "or manage broader client-reply changes."
         )
 
-        st.markdown("### Add a client to this week")
         st.caption(
-            "Use this when someone is not in the generated draft but you want them on this week. "
-            "This is a one-week override and does not change their normal recurrence."
+            "Need to add someone? Use the ＋ Add dog/client control directly under the day above."
         )
-
-        all_households = household_due_table(
-            st.session_state.clients,
-            pd.Timestamp(week_start_input),
-        )
-
-        if not all_households.empty:
-            manual_options = {}
-            for _, r in all_households.iterrows():
-                hid = str(r.get("Household ID", "") or "")
-                label = (
-                    f"{r.get('Owner', '')} — {r.get('Dogs', '')} "
-                    f"— {r.get('Status', '')}"
-                )
-                manual_options[label] = hid
-
-            selected_manual = st.selectbox(
-                "Client to add",
-                list(manual_options.keys()),
-                key=f"manual_add_client_{week_key}",
-            )
-            manual_hid = manual_options[selected_manual]
-            manual_row = all_households[
-                all_households["Household ID"].astype(str) == str(manual_hid)
-            ].iloc[0]
-
-            ma1, ma2 = st.columns(2)
-            with ma1:
-                manual_day = st.selectbox(
-                    "Add to day",
-                    ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"],
-                    key=f"manual_add_day_{week_key}",
-                )
-            with ma2:
-                normal_groomer = str(manual_row.get("Groomer", "") or "")
-                if normal_groomer == "Jen":
-                    groomer_choices = ["Jen"]
-                elif normal_groomer == "Haley":
-                    groomer_choices = ["Haley"]
-                else:
-                    groomer_choices = ["Jen", "Haley"]
-                manual_groomer = st.selectbox(
-                    "Groomer for this week",
-                    groomer_choices,
-                    key=f"manual_add_groomer_{week_key}",
-                )
-
-            allowed_days = WORKDAYS.get(manual_groomer, [])
-            if manual_day not in allowed_days:
-                st.warning(
-                    f"{manual_groomer} does not normally work on {manual_day}. "
-                    "Choose one of their working days."
-                )
-            elif st.button(
-                "Add client to this week",
-                type="primary",
-                key=f"manual_add_button_{week_key}",
-            ):
-                week_overrides[manual_hid] = {
-                    "response_status": "Manually added",
-                    "requested_day": manual_day,
-                    "requested_groomer": manual_groomer,
-                    "force_include": True,
-                }
-                st.session_state.week_client_responses[week_key] = week_overrides
-                try:
-                    save_week_override_db(week_key, manual_hid, week_overrides[manual_hid])
-                except Exception as exc:
-                    st.error(f"Could not permanently save this-week move: {exc}")
-
-                adjusted_plan = build_week_plan(
-                    st.session_state.clients,
-                    pd.Timestamp(week_start_input),
-                    daily_capacity_minutes=daily_capacity,
-                    max_appointments_per_day=max_appointments,
-                    week_overrides=week_overrides,
-                )
-                adjusted_plan = assign_times_to_weekly_plan(
-                    adjusted_plan,
-                    jen_start=jen_start,
-                    haley_start=haley_start,
-                    travel_buffer_minutes=travel_buffer,
-                    service_buffer_minutes=service_buffer,
-                )
-                st.session_state.week_route_plans[week_key] = adjusted_plan
-                st.session_state.week_plan_statuses[week_key] = "draft"
-                st.session_state.week_plan_fingerprints[week_key] = current_fingerprint
-                try:
-                    save_week_draft_db(
-                        week_key,
-                        adjusted_plan,
-                        current_settings,
-                        current_fingerprint,
-                    )
-                    set_week_draft_status_db(week_key, "draft")
-                except Exception as exc:
-                    st.error(
-                        "The move was applied on screen, but the weekly draft "
-                        f"could not be saved permanently: {exc}"
-                    )
-                st.rerun()
 
         st.markdown("### Client replies / this-week changes")
         st.caption(
@@ -8101,6 +8168,6 @@ with export_tab:
         st.code('GOOGLE_MAPS_API_KEY = "your-key-here"')
 
 st.caption(
-    "Mobile Grooming Planner v28 · private Supabase data · recurring service schedules · "
+    "Mobile Grooming Planner v29 · private Supabase data · recurring service schedules · "
     "weekly/monthly planning · completion tracking · optional Google Maps routing."
 )
