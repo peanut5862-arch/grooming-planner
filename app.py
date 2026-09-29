@@ -15,12 +15,12 @@ except Exception:
     create_client = None
 
 st.set_page_config(
-    page_title="Mobile Grooming Planner v21.2",
+    page_title="Mobile Grooming Planner v21.3",
     page_icon="🐾",
     layout="wide",
 )
 
-st.title("🐾 Mobile Grooming Planner v21.2")
+st.title("🐾 Mobile Grooming Planner v21.3")
 st.caption("Private client manager + due-date intelligence + cancellation filling + optional real drive-time scoring.")
 
 WORKDAYS = {
@@ -3073,6 +3073,19 @@ def get_week_plan_for_day(day_value):
     Load the saved weekly plan that contains day_value.
     Prefer the current session copy, otherwise restore the persisted Supabase copy.
     """
+    # Today is the first tab, so these weekly-session containers must exist
+    # before the later Weekly Route Builder section initializes them.
+    if "week_client_responses" not in st.session_state:
+        st.session_state.week_client_responses = {}
+    if "week_route_plans" not in st.session_state:
+        st.session_state.week_route_plans = {}
+    if "week_builder_settings" not in st.session_state:
+        st.session_state.week_builder_settings = {}
+    if "week_plan_fingerprints" not in st.session_state:
+        st.session_state.week_plan_fingerprints = {}
+    if "week_plan_statuses" not in st.session_state:
+        st.session_state.week_plan_statuses = {}
+
     day_ts = pd.Timestamp(day_value).normalize()
     monday = day_ts - pd.Timedelta(days=day_ts.weekday())
     week_key = monday.date().isoformat()
@@ -3086,9 +3099,9 @@ def get_week_plan_for_day(day_value):
         "service_buffer": 0,
     }
 
-    plan = st.session_state.week_route_plans.get(week_key)
-    settings = st.session_state.week_builder_settings.get(week_key)
-    status = st.session_state.week_plan_statuses.get(week_key)
+    plan = st.session_state.get("week_route_plans", {}).get(week_key)
+    settings = st.session_state.get("week_builder_settings", {}).get(week_key)
+    status = st.session_state.get("week_plan_statuses", {}).get(week_key)
 
     if plan is None:
         saved = load_week_draft_db(week_key)
