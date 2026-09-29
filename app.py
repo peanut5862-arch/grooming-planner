@@ -15,12 +15,12 @@ except Exception:
     create_client = None
 
 st.set_page_config(
-    page_title="Mobile Grooming Planner v12.4",
+    page_title="Mobile Grooming Planner v12.5",
     page_icon="🐾",
     layout="wide",
 )
 
-st.title("🐾 Mobile Grooming Planner v12.4")
+st.title("🐾 Mobile Grooming Planner v12.5")
 st.caption("Private client manager + due-date intelligence + cancellation filling + optional real drive-time scoring.")
 
 WORKDAYS = {
@@ -1030,6 +1030,65 @@ def db_secret(name, default=""):
     except Exception:
         return os.getenv(name, default)
 
+
+def supabase_project_ref_from_url():
+    url = str(db_secret("SUPABASE_URL", "") or "").strip().rstrip("/")
+    match = re.match(r"^https://([a-z0-9-]+)\.supabase\.co$", url, re.I)
+    return match.group(1) if match else ""
+
+def legacy_key_project_ref():
+    """
+    Safely decode only the middle JWT payload locally to read the project ref.
+    Never logs or displays the key itself.
+    """
+    import base64
+    import json
+
+    key = str(db_secret("SUPABASE_SERVICE_ROLE_KEY", "") or "").strip()
+    if not key.startswith("eyJ"):
+        return ""
+
+    try:
+        parts = key.split(".")
+        if len(parts) != 3:
+            return ""
+        payload = parts[1] + "=" * (-len(parts[1]) % 4)
+        decoded = base64.urlsafe_b64decode(payload.encode("ascii"))
+        data = json.loads(decoded.decode("utf-8"))
+        return str(data.get("ref", "") or "")
+    except Exception:
+        return ""
+
+def supabase_connection_test():
+    """
+    Actually test the configured credentials. Returns (ok, message).
+    No secrets are returned or logged.
+    """
+    if not supabase_configured():
+        return False, "Supabase credentials are missing."
+
+    url_ref = supabase_project_ref_from_url()
+    key_ref = legacy_key_project_ref()
+
+    if url_ref and key_ref and url_ref != key_ref:
+        return False, (
+            f"Project mismatch: URL is for {url_ref}, but the legacy service_role "
+            f"key is for {key_ref}."
+        )
+
+    try:
+        sb = get_supabase()
+        sb.table("dogs").select("id").limit(1).execute()
+        return True, "Private database connected and verified."
+    except Exception as exc:
+        msg = str(exc)
+        if "401" in msg or "Invalid API key" in msg:
+            return False, (
+                "Supabase rejected the API key (401). Re-copy the URL and service_role "
+                "key from the SAME Supabase project."
+            )
+        return False, f"Database test failed: {msg}"
+
 def supabase_configured():
     return bool(
         db_secret("SUPABASE_URL", "")
@@ -1208,12 +1267,29 @@ if "appointments" not in st.session_state:
 st.sidebar.header("Private data")
 
 if supabase_configured():
-    st.sidebar.success("Private database connected")
+    db_ok, db_message = supabase_connection_test()
+    if db_ok:
+        st.sidebar.success(db_message)
+    else:
+        st.sidebar.error(db_message)
+
+        url_ref = supabase_project_ref_from_url()
+        key_ref = legacy_key_project_ref()
+        if url_ref:
+            st.sidebar.caption(f"URL project ref: {url_ref}")
+        if key_ref:
+            st.sidebar.caption(f"Key project ref: {key_ref}")
+
     if st.sidebar.button("Refresh database"):
         try:
-            st.session_state.clients = load_dogs_from_db()
-            st.session_state.appointments = load_appointments_from_db()
-            st.rerun()
+            get_supabase.clear()
+            db_ok, db_message = supabase_connection_test()
+            if not db_ok:
+                st.sidebar.error(db_message)
+            else:
+                st.session_state.clients = load_dogs_from_db()
+                st.session_state.appointments = load_appointments_from_db()
+                st.rerun()
         except Exception as exc:
             st.sidebar.error(f"Database refresh failed: {exc}")
 else:
@@ -1951,6 +2027,7 @@ with clients_tab:
 
                 if supabase_configured():
                     try:
+                        get_supabase.clear()
                         insert_dog_db(new_row)
                         st.session_state.clients = load_dogs_from_db()
                         st.success(f"{new_dog} added for {new_owner} and saved.")
