@@ -15,12 +15,12 @@ except Exception:
     create_client = None
 
 st.set_page_config(
-    page_title="Mobile Grooming Planner v15.3",
+    page_title="Mobile Grooming Planner v15.5",
     page_icon="🐾",
     layout="wide",
 )
 
-st.title("🐾 Mobile Grooming Planner v15.3")
+st.title("🐾 Mobile Grooming Planner v15.5")
 st.caption("Private client manager + due-date intelligence + cancellation filling + optional real drive-time scoring.")
 
 WORKDAYS = {
@@ -1494,6 +1494,66 @@ def get_supabase():
         db_secret("SUPABASE_SERVICE_ROLE_KEY"),
     )
 
+
+def load_week_overrides_db(week_key):
+    """Load saved one-week scheduling overrides from Supabase."""
+    if not supabase_configured():
+        return {}
+
+    try:
+        rows = (
+            get_supabase()
+            .table("weekly_overrides")
+            .select("household_id,response_status,requested_day,requested_groomer,force_include")
+            .eq("week_start", str(week_key))
+            .execute()
+            .data
+            or []
+        )
+        return {
+            str(r.get("household_id")): {
+                "response_status": r.get("response_status") or "Not contacted",
+                "requested_day": r.get("requested_day") or "",
+                "requested_groomer": r.get("requested_groomer") or "",
+                "force_include": bool(r.get("force_include", False)),
+            }
+            for r in rows
+            if r.get("household_id")
+        }
+    except Exception:
+        # If the migration has not been run yet, keep session-only behavior.
+        return {}
+
+
+def save_week_override_db(week_key, household_id, override):
+    """Persist one household's this-week override."""
+    if not supabase_configured():
+        return
+
+    payload = {
+        "week_start": str(week_key),
+        "household_id": str(household_id),
+        "response_status": override.get("response_status") or "Not contacted",
+        "requested_day": override.get("requested_day") or None,
+        "requested_groomer": override.get("requested_groomer") or None,
+        "force_include": bool(override.get("force_include", False)),
+    }
+    (
+        get_supabase()
+        .table("weekly_overrides")
+        .upsert(payload, on_conflict="week_start,household_id")
+        .execute()
+    )
+
+
+def clear_week_overrides_db(week_key):
+    """Delete only the temporary overrides for one planning week."""
+    if not supabase_configured():
+        return
+    get_supabase().table("weekly_overrides").delete().eq(
+        "week_start", str(week_key)
+    ).execute()
+
 def clean_scalar(value):
     if value is None:
         return None
@@ -2136,75 +2196,6 @@ with planner_tab:
 
 # ---------- Household / dog-level helpers ----------
 
-def household_due_table(dog_df, target_date):
-    """Aggregate dog-level rows into one schedulable household appointment."""
-    due = calculate_due_fields(dog_df, target_date).copy()
-
-    rows = []
-    for household_id, group in due.groupby("Household ID", dropna=False):
-        group = group.copy()
-
-        owner = str(group["Owner"].dropna().iloc[0]) if group["Owner"].notna().any() else ""
-        dogs = ", ".join([str(x) for x in group["Dog"].dropna() if str(x).strip()])
-        area = str(group["Area"].dropna().iloc[0]) if group["Area"].notna().any() else ""
-        groomer = str(group["Groomer"].dropna().iloc[0]) if group["Groomer"].notna().any() else ""
-
-        # Household is considered due by the most urgent dog.
-        days_until_due = group["Days Until Due"].min() if group["Days Until Due"].notna().any() else None
-
-        if pd.isna(days_until_due):
-            status = "Unknown"
-        elif days_until_due < 0:
-            status = "🔴 Overdue"
-        elif days_until_due <= 7:
-            status = "🟠 Due this week"
-        elif days_until_due <= 14:
-            status = "🟡 Due next week"
-        else:
-            status = "🟢 Not due yet"
-
-        override = group["Household Override Minutes"].dropna()
-        if not override.empty and float(override.iloc[0]) > 0:
-            total_minutes = float(override.iloc[0])
-        else:
-            total_minutes = group["Minutes"].fillna(0).sum()
-
-        total_price = group["Price"].fillna(0).sum()
-
-        last_contacted = group["Last Contacted"].max() if group["Last Contacted"].notna().any() else pd.NaT
-        lat = group["Latitude"].dropna().iloc[0] if group["Latitude"].notna().any() else None
-        lon = group["Longitude"].dropna().iloc[0] if group["Longitude"].notna().any() else None
-        address = str(group["Address"].dropna().iloc[0]) if group["Address"].notna().any() else ""
-        city = str(group["City"].dropna().iloc[0]) if group["City"].notna().any() else ""
-        state = str(group["State"].dropna().iloc[0]) if group["State"].notna().any() else ""
-        zip_code = str(group["ZIP"].dropna().iloc[0]) if group["ZIP"].notna().any() else ""
-
-        rows.append({
-            "Household ID": household_id,
-            "Owner": owner,
-            "Dogs": dogs,
-            "Area": area,
-            "Groomer": groomer,
-            "Days Until Due": days_until_due,
-            "Status": status,
-            "Price": total_price,
-            "Minutes": total_minutes,
-            "Last Contacted": last_contacted,
-            "Latitude": lat,
-            "Longitude": lon,
-            "Address": address,
-            "City": city,
-            "State": state,
-            "ZIP": zip_code,
-        })
-
-    return pd.DataFrame(rows)
-
-def household_member_detail(dog_df, household_id):
-    group = dog_df[dog_df["Household ID"] == household_id].copy()
-    return group[["Owner", "Dog", "Minutes", "Price", "Frequency Weeks", "Last Groom"]]
-
-
 # ---------- Weekly route builder ----------
 
 if "week_client_responses" not in st.session_state:
@@ -2266,7 +2257,7 @@ with weekly_tab:
     week_key = selected_week_monday.date().isoformat()
 
     if week_key not in st.session_state.week_client_responses:
-        st.session_state.week_client_responses[week_key] = {}
+        st.session_state.week_client_responses[week_key] = load_week_overrides_db(week_key)
     week_overrides = st.session_state.week_client_responses[week_key]
 
     default_settings = {
@@ -2387,6 +2378,10 @@ with weekly_tab:
             st.session_state.week_route_plans.pop(week_key, None)
             st.session_state.week_plan_fingerprints.pop(week_key, None)
             st.session_state.week_client_responses[week_key] = {}
+            try:
+                clear_week_overrides_db(week_key)
+            except Exception as exc:
+                st.warning(f"Could not clear saved weekly changes: {exc}")
             st.session_state.week_builder_settings[week_key] = default_settings.copy()
             for key in [
                 f"daily_capacity_{week_key}",
@@ -2519,6 +2514,10 @@ with weekly_tab:
                     "force_include": True,
                 }
                 st.session_state.week_client_responses[week_key] = week_overrides
+                try:
+                    save_week_override_db(week_key, manual_hid, week_overrides[manual_hid])
+                except Exception as exc:
+                    st.error(f"Could not permanently save this-week move: {exc}")
 
                 adjusted_plan = build_week_plan(
                     st.session_state.clients,
@@ -2617,6 +2616,10 @@ with weekly_tab:
                         "force_include": previous_override.get("force_include", False),
                     }
                     st.session_state.week_client_responses[week_key] = week_overrides
+                    try:
+                        save_week_override_db(week_key, selected_hid, week_overrides[selected_hid])
+                    except Exception as exc:
+                        st.error(f"Could not permanently save this-week change: {exc}")
 
                     adjusted_plan = build_week_plan(
                         st.session_state.clients,
@@ -2641,6 +2644,10 @@ with weekly_tab:
             with c_reply2:
                 if st.button("Clear this week's changes"):
                     st.session_state.week_client_responses[week_key] = {}
+                    try:
+                        clear_week_overrides_db(week_key)
+                    except Exception as exc:
+                        st.error(f"Could not clear saved weekly changes: {exc}")
                     cleared_plan = build_week_plan(
                         st.session_state.clients,
                         pd.Timestamp(week_start_input),
