@@ -15,12 +15,12 @@ except Exception:
     create_client = None
 
 st.set_page_config(
-    page_title="Mobile Grooming Planner v12.9",
+    page_title="Mobile Grooming Planner v12.10",
     page_icon="🐾",
     layout="wide",
 )
 
-st.title("🐾 Mobile Grooming Planner v12.9")
+st.title("🐾 Mobile Grooming Planner v12.10")
 st.caption("Private client manager + due-date intelligence + cancellation filling + optional real drive-time scoring.")
 
 WORKDAYS = {
@@ -1271,6 +1271,18 @@ def upsert_dogs_db(df):
     payloads = []
 
     for _, row in df.iterrows():
+        # Streamlit's dynamic editor can include a blank "new row".
+        # Never send that placeholder row to Supabase.
+        owner = str(row.get("Owner", "") or "").strip()
+        dog = str(row.get("Dog", "") or "").strip()
+
+        if not owner and not dog:
+            continue
+
+        # Owner and dog are required for a real record.
+        if not owner or not dog:
+            continue
+
         payload = dog_row_to_db(row)
         record_id = row.get("Record ID")
 
@@ -2237,7 +2249,7 @@ with clients_tab:
         editor_df,
         use_container_width=True,
         hide_index=True,
-        num_rows="dynamic",
+        num_rows="fixed",
         disabled=["Record ID"] if "Record ID" in editor_df.columns else [],
         column_config={
             "Frequency Weeks": st.column_config.NumberColumn("Frequency Weeks", min_value=1, step=1),
@@ -2250,6 +2262,11 @@ with clients_tab:
             ),
         },
         key="client_editor",
+    )
+
+    st.caption(
+        "The checkbox on the left is only the table's row selector. "
+        "Save dog edits saves the whole edited table, not just the checked row."
     )
 
     if st.button("Save dog edits", type="primary"):
