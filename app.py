@@ -15,12 +15,12 @@ except Exception:
     create_client = None
 
 st.set_page_config(
-    page_title="Mobile Grooming Planner v18.4",
+    page_title="Mobile Grooming Planner v18.5",
     page_icon="🐾",
     layout="wide",
 )
 
-st.title("🐾 Mobile Grooming Planner v18.4")
+st.title("🐾 Mobile Grooming Planner v18.5")
 st.caption("Private client manager + due-date intelligence + cancellation filling + optional real drive-time scoring.")
 
 WORKDAYS = {
@@ -1716,6 +1716,37 @@ def set_week_draft_status_db(week_key, status):
     )
 
 
+
+def load_month_unconfirmed_drafts_db(month_start, month_end):
+    """Return saved draft weeks overlapping the selected month."""
+    if not supabase_configured():
+        return []
+
+    try:
+        month_start = pd.Timestamp(month_start).normalize()
+        month_end = pd.Timestamp(month_end).normalize()
+
+        query_start = (
+            month_start - pd.Timedelta(days=month_start.weekday())
+        ).date().isoformat()
+        query_end = month_end.date().isoformat()
+
+        return (
+            get_supabase()
+            .table("weekly_drafts")
+            .select("week_start,plan_json,status")
+            .gte("week_start", query_start)
+            .lte("week_start", query_end)
+            .eq("status", "draft")
+            .order("week_start")
+            .execute()
+            .data
+            or []
+        )
+    except Exception:
+        return []
+
+
 def load_month_drafts_db(month_start, month_end):
     """Load all saved weekly drafts that can contain dates inside a month."""
     if not supabase_configured():
@@ -2959,12 +2990,23 @@ with monthly_tab:
 
     service_history = confirmed_service_history(month_end)
 
-    projected = projected_month_services(
-        st.session_state.clients,
-        month_start,
-        month_end,
-        service_history=service_history,
-    )
+    today_ts = pd.Timestamp(date.today()).normalize()
+
+    if month_end < today_ts:
+        projected = pd.DataFrame(
+            columns=[
+                "Household ID", "Owner", "Dogs", "Projected Due",
+                "Area", "Groomer", "Minutes", "Price",
+            ]
+        )
+    else:
+        projection_start = max(month_start, today_ts)
+        projected = projected_month_services(
+            st.session_state.clients,
+            projection_start,
+            month_end,
+            service_history=service_history,
+        )
 
     confirmed_hids = set(
         month_only.get("Household ID", pd.Series(dtype=str))
@@ -3009,9 +3051,35 @@ with monthly_tab:
 
     if month_plan.empty:
         st.info(
-            "No confirmed appointments are on this month yet. Build and adjust "
-            "a week in Weekly Route Builder, then tap Confirm this week."
+            "No confirmed appointments are on this month yet."
         )
+
+        unconfirmed_weeks = load_month_unconfirmed_drafts_db(
+            month_start,
+            month_end,
+        )
+
+        if unconfirmed_weeks:
+            draft_labels = []
+            for saved in unconfirmed_weeks:
+                week_value = pd.to_datetime(
+                    saved.get("week_start"),
+                    errors="coerce",
+                )
+                if not pd.isna(week_value):
+                    draft_labels.append(f"{week_value:%b %d}")
+
+            label_text = ", ".join(draft_labels) if draft_labels else "this month"
+
+            st.warning(
+                f"You do have saved draft schedule(s) for: {label_text}. "
+                "They are hidden here until you open that week in Weekly Route Builder "
+                "and tap Confirm this week."
+            )
+        else:
+            st.caption(
+                "Build and adjust a week in Weekly Route Builder, then tap Confirm this week."
+            )
     else:
         month_plan["_Date Sort"] = pd.to_datetime(
             month_plan["Date"],
@@ -3103,8 +3171,8 @@ with monthly_tab:
     st.markdown("### Projected / unscheduled this month")
     st.caption(
         "These are expected from the recurring service schedules, but they are "
-        "not appointments yet. Confirmed appointments are used as the new recurrence "
-        "starting point before this list is calculated."
+        "not appointments yet. For the current month, past due dates are hidden; "
+        "only today forward is projected. Confirmed appointments reset the recurrence clock."
     )
 
     if projected_unscheduled.empty:
