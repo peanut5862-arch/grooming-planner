@@ -16,12 +16,12 @@ except Exception:
     create_client = None
 
 st.set_page_config(
-    page_title="Mobile Grooming Planner v22",
+    page_title="Mobile Grooming Planner v23",
     page_icon="🐾",
     layout="wide",
 )
 
-st.title("🐾 Mobile Grooming Planner v22")
+st.title("🐾 Mobile Grooming Planner v23")
 st.caption("Private client manager + due-date intelligence + weekly routing + real Google Maps drive-time optimization.")
 
 WORKDAYS = {
@@ -104,6 +104,48 @@ require_password()
 
 def get_maps_key():
     return get_secret("GOOGLE_MAPS_API_KEY", "")
+
+
+def get_groomer_home_address(groomer):
+    """Read a groomer's private home address from Streamlit Secrets."""
+    secret_name = {
+        "Jen": "JEN_HOME_ADDRESS",
+        "Haley": "HALEY_HOME_ADDRESS",
+    }.get(str(groomer or "").strip())
+
+    if not secret_name:
+        return ""
+
+    return str(get_secret(secret_name, "") or "").strip()
+
+
+def get_groomer_home_coords(groomer, maps_key):
+    """
+    Geocode a groomer's private home address and cache only the coordinates
+    in the current Streamlit session. The address itself stays in Secrets.
+    """
+    if not maps_key:
+        return None
+
+    cache = st.session_state.setdefault("groomer_home_coords", {})
+    if groomer in cache:
+        return cache[groomer]
+
+    address = get_groomer_home_address(groomer)
+    if not address:
+        return None
+
+    try:
+        lat, lon = geocode_address(address, maps_key)
+    except Exception:
+        return None
+
+    if lat is None or lon is None:
+        return None
+
+    cache[groomer] = (float(lat), float(lon))
+    return cache[groomer]
+
 
 def get_json(url, headers=None, data=None):
     req = urllib.request.Request(url, headers=headers or {}, data=data)
@@ -253,19 +295,28 @@ def household_coords(household_id, maps_key=None, geocode_if_missing=False):
     return float(lat), float(lon)
 
 
-def _best_route_order(indexes, coords_by_index, maps_key):
+def _best_route_order(
+    indexes,
+    coords_by_index,
+    maps_key,
+    start_coord=None,
+    end_coord=None,
+):
     """
-    Find the shortest open path through a small daily route.
-    Weekly planner caps each groomer/day at a small number of stops, so testing
-    all orders is practical once pairwise drive times have been fetched.
+    Find the shortest route through the day's clients.
+
+    When home coordinates are supplied, total route cost includes:
+      home -> first client -> ... -> last client -> home
     """
     indexes = list(indexes)
-    if len(indexes) <= 1:
-        return indexes, {}
+    if not indexes:
+        return indexes, {}, {}, {}
 
     pair_metrics = {}
+    start_metrics = {}
+    end_metrics = {}
 
-    # Fetch each directed pair once.
+    # Client-to-client directed legs.
     for a in indexes:
         for b in indexes:
             if a == b:
@@ -285,13 +336,64 @@ def _best_route_order(indexes, coords_by_index, maps_key):
                     float(minutes),
                 )
 
+    # Home/start -> each client.
+    if start_coord is not None:
+        for idx in indexes:
+            try:
+                miles, minutes = route_metrics(
+                    start_coord,
+                    coords_by_index[idx],
+                    maps_key,
+                )
+            except Exception:
+                miles, minutes = None, None
+            if minutes is not None:
+                start_metrics[idx] = (
+                    float(miles or 0),
+                    float(minutes),
+                )
+
+    # Each client -> home/end.
+    if end_coord is not None:
+        for idx in indexes:
+            try:
+                miles, minutes = route_metrics(
+                    coords_by_index[idx],
+                    end_coord,
+                    maps_key,
+                )
+            except Exception:
+                miles, minutes = None, None
+            if minutes is not None:
+                end_metrics[idx] = (
+                    float(miles or 0),
+                    float(minutes),
+                )
+
     def path_minutes(order):
+        if not order:
+            return 0.0
+
         total = 0.0
+
+        if start_coord is not None:
+            metric = start_metrics.get(order[0])
+            if metric is None:
+                return float("inf")
+            total += metric[1]
+
         for a, b in zip(order, order[1:]):
             metric = pair_metrics.get((a, b))
             if metric is None:
                 return float("inf")
             total += metric[1]
+
+        if end_coord is not None:
+            metric = end_metrics.get(order[-1])
+            if metric is None:
+                return float("inf")
+            total += metric[1]
+
         return total
 
     best = indexes
@@ -303,7 +405,7 @@ def _best_route_order(indexes, coords_by_index, maps_key):
             best = list(perm)
             best_minutes = minutes
 
-    return best, pair_metrics
+    return best, pair_metrics, start_metrics, end_metrics
 
 
 def optimize_week_with_google_maps(
@@ -314,8 +416,11 @@ def optimize_week_with_google_maps(
     service_buffer_minutes=0,
 ):
     """
-    Reorder each groomer/day using actual Google Routes drive times and then
-    rebuild appointment start/end times from those real leg durations.
+    Optimize each groomer/day using real road drive times.
+
+    If a groomer's home address is present in Streamlit Secrets, route cost and
+    timing include leaving home before the first client and returning home after
+    the final client.
     """
     if plan is None or plan.empty:
         return plan, []
@@ -326,6 +431,8 @@ def optimize_week_with_google_maps(
         ("Route Order", 0),
         ("Drive From Previous Min", 0.0),
         ("Drive From Previous Miles", 0.0),
+        ("Drive Home After Min", 0.0),
+        ("Drive Home After Miles", 0.0),
         ("Routing Mode", ""),
     ]:
         if col not in optimized.columns:
@@ -374,18 +481,43 @@ def optimize_week_with_google_maps(
                 "was unavailable."
             )
 
+        home_address = get_groomer_home_address(groomer)
+        home_coord = get_groomer_home_coords(groomer, maps_key)
+
+        if home_address and home_coord is None:
+            routing_notes.append(
+                f"{pd.Timestamp(day_date):%a %b %d} · {groomer}: "
+                "the private home address could not be geocoded, so this day was "
+                "optimized between clients only."
+            )
+        elif not home_address:
+            routing_notes.append(
+                f"{pd.Timestamp(day_date):%a %b %d} · {groomer}: "
+                "no private home address is configured, so this day was optimized "
+                "between clients only."
+            )
+
         routable = [idx for idx in group.index if idx in coords]
         unroutable = [idx for idx in group.index if idx not in coords]
 
-        if len(routable) >= 2:
-            best_order, pair_metrics = _best_route_order(
+        if routable:
+            (
+                best_order,
+                pair_metrics,
+                start_metrics,
+                end_metrics,
+            ) = _best_route_order(
                 routable,
                 coords,
                 maps_key,
+                start_coord=home_coord,
+                end_coord=home_coord,
             )
         else:
-            best_order = routable
+            best_order = []
             pair_metrics = {}
+            start_metrics = {}
+            end_metrics = {}
 
         # Keep any unroutable appointment after the routable stops instead of
         # silently dropping it.
@@ -394,19 +526,28 @@ def optimize_week_with_google_maps(
         current_time = jen_start if groomer == "Jen" else haley_start
         previous_idx = None
 
+        # Clear old return-home values for this groomer/day.
+        for row_index in group.index:
+            optimized.at[row_index, "Drive Home After Min"] = 0.0
+            optimized.at[row_index, "Drive Home After Miles"] = 0.0
+
         for position, row_index in enumerate(final_order, start=1):
             drive_miles = 0.0
             drive_minutes = 0.0
 
-            if previous_idx is not None:
+            if previous_idx is None and home_coord is not None:
+                metric = start_metrics.get(row_index)
+                if metric is not None:
+                    drive_miles, drive_minutes = metric
+            elif previous_idx is not None:
                 metric = pair_metrics.get((previous_idx, row_index))
                 if metric is not None:
                     drive_miles, drive_minutes = metric
 
-                current_time = add_minutes_to_time(
-                    current_time,
-                    int(round(drive_minutes)),
-                )
+            current_time = add_minutes_to_time(
+                current_time,
+                int(round(drive_minutes)),
+            )
 
             duration = pd.to_numeric(
                 optimized.at[row_index, "Minutes"],
@@ -428,9 +569,13 @@ def optimize_week_with_google_maps(
                 drive_miles, 1
             )
             optimized.at[row_index, "Routing Mode"] = (
-                "Google Maps"
-                if row_index in coords
-                else "Address missing"
+                "Google Maps + Home"
+                if row_index in coords and home_coord is not None
+                else (
+                    "Google Maps"
+                    if row_index in coords
+                    else "Address missing"
+                )
             )
             optimized.at[row_index, "Start Time"] = format_clock(start_t)
             optimized.at[row_index, "End Time"] = format_clock(end_t)
@@ -438,14 +583,29 @@ def optimize_week_with_google_maps(
             current_time = end_t
             previous_idx = row_index
 
+        # Add the final client's return-home leg for totals/display.
+        if best_order and home_coord is not None:
+            last_idx = best_order[-1]
+            return_metric = end_metrics.get(last_idx)
+            if return_metric is not None:
+                return_miles, return_minutes = return_metric
+                optimized.at[last_idx, "Drive Home After Min"] = round(
+                    return_minutes, 1
+                )
+                optimized.at[last_idx, "Drive Home After Miles"] = round(
+                    return_miles, 1
+                )
+
     return optimized, routing_notes
 
 
-def google_maps_route_url(day_group):
+def google_maps_route_url(day_group, groomer=None):
     """
-    Open the currently displayed route in Google Maps using the saved client
-    addresses and current appointment order. Google Maps will use the phone's
-    current location as the starting point.
+    Open the displayed route in Google Maps.
+
+    When a private home address exists for the groomer, the Maps route starts
+    and ends at home. The private address is read from Secrets and is never
+    written into the schedule/database.
     """
     if day_group is None or day_group.empty:
         return ""
@@ -477,16 +637,30 @@ def google_maps_route_url(day_group):
     if not addresses:
         return ""
 
-    destination = addresses[-1]
-    waypoints = addresses[:-1]
+    if not groomer and "Groomer" in group.columns and not group.empty:
+        groomer = str(group.iloc[0].get("Groomer", "") or "").strip()
 
-    params = {
-        "api": "1",
-        "destination": destination,
-        "travelmode": "driving",
-    }
-    if waypoints:
-        params["waypoints"] = "|".join(waypoints)
+    home_address = get_groomer_home_address(groomer)
+
+    if home_address:
+        params = {
+            "api": "1",
+            "origin": home_address,
+            "destination": home_address,
+            "waypoints": "|".join(addresses),
+            "travelmode": "driving",
+        }
+    else:
+        # Fallback: current phone location -> client route.
+        destination = addresses[-1]
+        waypoints = addresses[:-1]
+        params = {
+            "api": "1",
+            "destination": destination,
+            "travelmode": "driving",
+        }
+        if waypoints:
+            params["waypoints"] = "|".join(waypoints)
 
     return "https://www.google.com/maps/dir/?" + urllib.parse.urlencode(
         params,
@@ -1308,7 +1482,9 @@ def render_weekly_cards(valid_plan, daily_capacity, travel_buffer):
                     errors="coerce",
                 )
                 if (
-                    str(row.get("Routing Mode", "") or "") == "Google Maps"
+                    str(row.get("Routing Mode", "") or "") in {
+                        "Google Maps", "Google Maps + Home"
+                    }
                     and pd.notna(drive_minutes)
                     and float(drive_minutes) > 0
                 ):
@@ -1333,12 +1509,12 @@ def render_weekly_cards(valid_plan, daily_capacity, travel_buffer):
                 "Routing Mode" in groomer_group.columns
                 and groomer_group["Routing Mode"]
                 .fillna("")
-                .eq("Google Maps")
+                .isin(["Google Maps", "Google Maps + Home"])
                 .any()
             )
 
             if has_real_routing:
-                travel_total = int(round(
+                outbound_and_between_min = float(
                     pd.to_numeric(
                         groomer_group.get(
                             "Drive From Previous Min",
@@ -1346,8 +1522,21 @@ def render_weekly_cards(valid_plan, daily_capacity, travel_buffer):
                         ),
                         errors="coerce",
                     ).fillna(0).sum()
+                )
+                return_home_min = float(
+                    pd.to_numeric(
+                        groomer_group.get(
+                            "Drive Home After Min",
+                            pd.Series(dtype=float),
+                        ),
+                        errors="coerce",
+                    ).fillna(0).sum()
+                )
+                travel_total = int(round(
+                    outbound_and_between_min + return_home_min
                 ))
-                drive_miles = float(
+
+                outbound_and_between_miles = float(
                     pd.to_numeric(
                         groomer_group.get(
                             "Drive From Previous Miles",
@@ -1356,13 +1545,37 @@ def render_weekly_cards(valid_plan, daily_capacity, travel_buffer):
                         errors="coerce",
                     ).fillna(0).sum()
                 )
+                return_home_miles = float(
+                    pd.to_numeric(
+                        groomer_group.get(
+                            "Drive Home After Miles",
+                            pd.Series(dtype=float),
+                        ),
+                        errors="coerce",
+                    ).fillna(0).sum()
+                )
+                drive_miles = (
+                    outbound_and_between_miles + return_home_miles
+                )
                 open_minutes = max(
                     int(daily_capacity) - used_minutes - travel_total,
                     0,
                 )
+                home_mode = (
+                    "Routing Mode" in groomer_group.columns
+                    and groomer_group["Routing Mode"]
+                    .fillna("")
+                    .eq("Google Maps + Home")
+                    .any()
+                )
+                route_scope = (
+                    "home → clients → home"
+                    if home_mode
+                    else "between client stops"
+                )
                 st.caption(
                     f"{groomer}: {travel_total} drive min · "
-                    f"{drive_miles:.1f} mi between stops · "
+                    f"{drive_miles:.1f} mi · {route_scope} · "
                     f"{open_minutes} open min remaining"
                 )
             else:
@@ -1376,7 +1589,7 @@ def render_weekly_cards(valid_plan, daily_capacity, travel_buffer):
                     f"(using {travel_buffer}-min estimated travel/setup buffers)"
                 )
 
-            maps_url = google_maps_route_url(groomer_group)
+            maps_url = google_maps_route_url(groomer_group, groomer=groomer)
             if maps_url:
                 st.link_button(
                     f"Open {groomer} route in Google Maps",
@@ -3455,6 +3668,22 @@ maps_key = get_maps_key()
 
 if maps_key:
     st.sidebar.success("Google Maps connected — real routing available")
+
+    configured_homes = [
+        groomer
+        for groomer in ["Jen", "Haley"]
+        if get_groomer_home_address(groomer)
+    ]
+    if len(configured_homes) == 2:
+        st.sidebar.success("Jen + Haley home routing configured")
+    elif configured_homes:
+        st.sidebar.caption(
+            f"Home routing configured for {configured_homes[0]} only."
+        )
+    else:
+        st.sidebar.caption(
+            "Home routing not configured yet; routes start between clients."
+        )
 else:
     st.sidebar.caption("Google Maps not connected yet.")
 
@@ -3689,7 +3918,9 @@ with today_tab:
                         )
                         drive_detail = ""
                         if (
-                            str(row.get("Routing Mode", "") or "") == "Google Maps"
+                            str(row.get("Routing Mode", "") or "") in {
+                            "Google Maps", "Google Maps + Home"
+                        }
                             and pd.notna(drive_minutes)
                             and float(drive_minutes) > 0
                         ):
@@ -3840,7 +4071,7 @@ with today_tab:
                                         f"Could not reschedule appointment: {exc}"
                                     )
 
-                today_maps_url = google_maps_route_url(groomer_rows)
+                today_maps_url = google_maps_route_url(groomer_rows, groomer=groomer)
                 if today_maps_url:
                     st.link_button(
                         f"🗺️ Open {groomer} route in Google Maps",
@@ -4899,6 +5130,8 @@ with weekly_tab:
 
                     st.success(
                         "Route optimized using Google Maps drive times. "
+                        "When a groomer's private home address is configured, "
+                        "the route now includes home → clients → home. "
                         "Review it, then confirm the week again."
                     )
                     st.rerun()
@@ -6582,6 +6815,6 @@ with export_tab:
         st.code('GOOGLE_MAPS_API_KEY = "your-key-here"')
 
 st.caption(
-    "Mobile Grooming Planner v22 · private Supabase data · recurring service schedules · "
+    "Mobile Grooming Planner v23 · private Supabase data · recurring service schedules · "
     "weekly/monthly planning · completion tracking · optional Google Maps routing."
 )
