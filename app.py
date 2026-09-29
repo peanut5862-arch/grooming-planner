@@ -15,12 +15,12 @@ except Exception:
     create_client = None
 
 st.set_page_config(
-    page_title="Mobile Grooming Planner v13",
+    page_title="Mobile Grooming Planner v14",
     page_icon="🐾",
     layout="wide",
 )
 
-st.title("🐾 Mobile Grooming Planner v13")
+st.title("🐾 Mobile Grooming Planner v14")
 st.caption("Private client manager + due-date intelligence + cancellation filling + optional real drive-time scoring.")
 
 WORKDAYS = {
@@ -37,6 +37,12 @@ CLIENT_COLUMNS = [
     "Groomer",
     "Last Groom",
     "Frequency Weeks",
+    "Service Pattern",
+    "Next Service",
+    "Bath Price",
+    "Bath Minutes",
+    "Groom Price",
+    "Groom Minutes",
     "Price",
     "Minutes",
     "Household Override Minutes",
@@ -208,6 +214,10 @@ def normalize_clients(df):
 
     for c in [
         "Frequency Weeks",
+        "Bath Price",
+        "Bath Minutes",
+        "Groom Price",
+        "Groom Minutes",
         "Price",
         "Minutes",
         "Household Override Minutes",
@@ -525,6 +535,83 @@ def score_candidates(
 
 
 
+
+# ---------- Service helpers ----------
+
+def effective_service_for_dog(row):
+    """
+    Decide which service this dog should receive on the next visit.
+    Supported patterns:
+      - Groom only
+      - Bath only
+      - Alternate: Groom/Bath
+    """
+    pattern = str(row.get("Service Pattern", "") or "").strip()
+    next_service = str(row.get("Next Service", "") or "").strip()
+
+    if pattern == "Bath only":
+        return "Bath"
+    if pattern == "Groom only":
+        return "Groom"
+    if pattern == "Alternate: Groom/Bath":
+        return next_service if next_service in {"Bath", "Groom"} else "Groom"
+
+    # Backward compatibility for older records.
+    if next_service in {"Bath", "Groom"}:
+        return next_service
+    return "Groom"
+
+
+def service_price_minutes(row):
+    """
+    Return (service_name, price, minutes) for the next scheduled service.
+    Falls back to legacy Price/Minutes values for older records.
+    """
+    service = effective_service_for_dog(row)
+
+    if service == "Bath":
+        price = row.get("Bath Price")
+        minutes = row.get("Bath Minutes")
+    else:
+        price = row.get("Groom Price")
+        minutes = row.get("Groom Minutes")
+
+    if pd.isna(price) or price is None:
+        price = row.get("Price")
+    if pd.isna(minutes) or minutes is None:
+        minutes = row.get("Minutes")
+
+    return service, price, minutes
+
+
+def advance_next_service_db(record_ids):
+    """
+    After a completed appointment, toggle Alternate dogs to their other service.
+    Groom-only and Bath-only dogs stay unchanged.
+    """
+    if not record_ids or not supabase_configured():
+        return
+
+    sb = get_supabase()
+
+    for record_id in record_ids:
+        response = sb.table("dogs").select(
+            "service_pattern,next_service"
+        ).eq("id", str(record_id)).limit(1).execute()
+
+        rows = response.data or []
+        if not rows:
+            continue
+
+        row = rows[0]
+        if row.get("service_pattern") == "Alternate: Groom/Bath":
+            current = row.get("next_service") or "Groom"
+            new_value = "Bath" if current == "Groom" else "Groom"
+            sb.table("dogs").update(
+                {"next_service": new_value}
+            ).eq("id", str(record_id)).execute()
+
+
 # ---------- Household / dog-level helpers ----------
 
 def household_due_table(dog_df, target_date):
@@ -561,7 +648,13 @@ def household_due_table(dog_df, target_date):
         group = group.copy()
 
         owner = str(group["Owner"].dropna().iloc[0]) if group["Owner"].notna().any() else ""
-        dogs = ", ".join([str(x) for x in group["Dog"].dropna() if str(x).strip()])
+        dog_service_labels = []
+        for _, dog_row in group.iterrows():
+            dog_name = str(dog_row.get("Dog", "") or "").strip()
+            service_name = effective_service_for_dog(dog_row)
+            if dog_name:
+                dog_service_labels.append(f"{dog_name} ({service_name})")
+        dogs = ", ".join(dog_service_labels)
         area = str(group["Area"].dropna().iloc[0]) if group["Area"].notna().any() else ""
         groomer = str(group["Groomer"].dropna().iloc[0]) if group["Groomer"].notna().any() else ""
 
@@ -579,13 +672,27 @@ def household_due_table(dog_df, target_date):
         else:
             status = "🟢 Not due yet"
 
+        service_values = group.apply(
+            lambda row: pd.Series(
+                service_price_minutes(row),
+                index=["Effective Service", "Effective Price", "Effective Minutes"],
+            ),
+            axis=1,
+        )
+
         override = group["Household Override Minutes"].dropna()
         if not override.empty and float(override.iloc[0]) > 0:
             total_minutes = float(override.iloc[0])
         else:
-            total_minutes = group["Minutes"].fillna(0).sum()
+            total_minutes = pd.to_numeric(
+                service_values["Effective Minutes"],
+                errors="coerce",
+            ).fillna(0).sum()
 
-        total_price = group["Price"].fillna(0).sum()
+        total_price = pd.to_numeric(
+            service_values["Effective Price"],
+            errors="coerce",
+        ).fillna(0).sum()
 
         last_contacted = group["Last Contacted"].max() if group["Last Contacted"].notna().any() else pd.NaT
         lat = group["Latitude"].dropna().iloc[0] if group["Latitude"].notna().any() else None
@@ -618,7 +725,20 @@ def household_due_table(dog_df, target_date):
 
 def household_member_detail(dog_df, household_id):
     group = dog_df[dog_df["Household ID"] == household_id].copy()
-    return group[["Owner", "Dog", "Minutes", "Price", "Frequency Weeks", "Last Groom"]]
+    return group[
+        [
+            "Owner",
+            "Dog",
+            "Service Pattern",
+            "Next Service",
+            "Bath Minutes",
+            "Bath Price",
+            "Groom Minutes",
+            "Groom Price",
+            "Frequency Weeks",
+            "Last Groom",
+        ]
+    ]
 
 
 # ---------- Weekly route builder ----------
@@ -1066,6 +1186,12 @@ APP_TO_DB_DOG = {
     "Groomer": "groomer",
     "Last Groom": "last_groom",
     "Frequency Weeks": "frequency_weeks",
+    "Service Pattern": "service_pattern",
+    "Next Service": "next_service",
+    "Bath Price": "bath_price",
+    "Bath Minutes": "bath_minutes",
+    "Groom Price": "groom_price",
+    "Groom Minutes": "groom_minutes",
     "Price": "price",
     "Minutes": "minutes",
     "Household Override Minutes": "household_override_minutes",
@@ -1212,6 +1338,10 @@ def clean_db_field(db_col, value):
 
     if db_col in {
         "frequency_weeks",
+        "bath_price",
+        "bath_minutes",
+        "groom_price",
+        "groom_minutes",
         "price",
         "minutes",
         "household_override_minutes",
@@ -2144,7 +2274,7 @@ with clients_tab:
                     key=f"new_dog_last_groom_{dog_number}",
                 )
 
-            d3, d4, d5 = st.columns(3)
+            d3, d4 = st.columns(2)
             with d3:
                 dog_frequency = st.selectbox(
                     "Frequency",
@@ -2154,28 +2284,75 @@ with clients_tab:
                     key=f"new_dog_frequency_{dog_number}",
                 )
             with d4:
-                dog_minutes = st.number_input(
-                    "Groom time",
-                    min_value=15,
-                    value=75,
-                    step=15,
-                    key=f"new_dog_minutes_{dog_number}",
+                service_pattern = st.selectbox(
+                    "Service pattern",
+                    ["Groom only", "Bath only", "Alternate: Groom/Bath"],
+                    key=f"new_dog_service_pattern_{dog_number}",
+                    help=(
+                        "Alternate means the dog's visits switch between a full groom "
+                        "and a bath."
+                    ),
                 )
-            with d5:
-                dog_price = st.number_input(
-                    "Price",
+
+            if service_pattern == "Alternate: Groom/Bath":
+                next_service = st.selectbox(
+                    "Next visit service",
+                    ["Groom", "Bath"],
+                    key=f"new_dog_next_service_{dog_number}",
+                )
+            elif service_pattern == "Bath only":
+                next_service = "Bath"
+                st.caption("Next visit: Bath")
+            else:
+                next_service = "Groom"
+                st.caption("Next visit: Groom")
+
+            b1, b2 = st.columns(2)
+            with b1:
+                bath_price = st.number_input(
+                    "Bath price",
                     min_value=0.0,
-                    value=100.0,
+                    value=0.0,
                     step=5.0,
-                    key=f"new_dog_price_{dog_number}",
+                    key=f"new_dog_bath_price_{dog_number}",
+                )
+            with b2:
+                bath_minutes = st.number_input(
+                    "Bath time (minutes)",
+                    min_value=0,
+                    value=0,
+                    step=15,
+                    key=f"new_dog_bath_minutes_{dog_number}",
+                )
+
+            g1, g2 = st.columns(2)
+            with g1:
+                groom_price = st.number_input(
+                    "Full groom price",
+                    min_value=0.0,
+                    value=0.0,
+                    step=5.0,
+                    key=f"new_dog_groom_price_{dog_number}",
+                )
+            with g2:
+                groom_minutes = st.number_input(
+                    "Full groom time (minutes)",
+                    min_value=0,
+                    value=0,
+                    step=15,
+                    key=f"new_dog_groom_minutes_{dog_number}",
                 )
 
             dog_entries.append({
                 "Dog": dog_name,
                 "Last Groom": dog_last_groom,
                 "Frequency Weeks": dog_frequency,
-                "Minutes": dog_minutes,
-                "Price": dog_price,
+                "Service Pattern": service_pattern,
+                "Next Service": next_service,
+                "Bath Price": bath_price if bath_price > 0 else None,
+                "Bath Minutes": bath_minutes if bath_minutes > 0 else None,
+                "Groom Price": groom_price if groom_price > 0 else None,
+                "Groom Minutes": groom_minutes if groom_minutes > 0 else None,
             })
 
         submitted = st.form_submit_button("Save household")
@@ -2187,6 +2364,20 @@ with clients_tab:
                 if not str(dog["Dog"]).strip()
             ]
 
+            missing_service_details = []
+            for i, dog in enumerate(dog_entries):
+                pattern = dog["Service Pattern"]
+                if pattern in {"Bath only", "Alternate: Groom/Bath"}:
+                    if not dog["Bath Price"] or not dog["Bath Minutes"]:
+                        missing_service_details.append(
+                            f"Dog {i + 1}: bath price/time"
+                        )
+                if pattern in {"Groom only", "Alternate: Groom/Bath"}:
+                    if not dog["Groom Price"] or not dog["Groom Minutes"]:
+                        missing_service_details.append(
+                            f"Dog {i + 1}: groom price/time"
+                        )
+
             if not new_owner.strip():
                 st.error("Owner name is required.")
             elif missing_names:
@@ -2194,6 +2385,11 @@ with clients_tab:
                     "Enter a dog name for dog "
                     + ", ".join(missing_names)
                     + "."
+                )
+            elif missing_service_details:
+                st.error(
+                    "Complete the required service pricing/time: "
+                    + "; ".join(missing_service_details)
                 )
             else:
                 household_id = get_or_create_household_id(
@@ -2217,8 +2413,24 @@ with clients_tab:
                         "Groomer": new_groomer,
                         "Last Groom": pd.Timestamp(dog["Last Groom"]),
                         "Frequency Weeks": dog["Frequency Weeks"],
-                        "Price": dog["Price"],
-                        "Minutes": dog["Minutes"],
+                        "Service Pattern": dog["Service Pattern"],
+                        "Next Service": dog["Next Service"],
+                        "Bath Price": dog["Bath Price"],
+                        "Bath Minutes": dog["Bath Minutes"],
+                        "Groom Price": dog["Groom Price"],
+                        "Groom Minutes": dog["Groom Minutes"],
+                        # Legacy fields mirror the next service so older planner paths
+                        # remain compatible while v14 transitions fully to service-aware data.
+                        "Price": (
+                            dog["Bath Price"]
+                            if dog["Next Service"] == "Bath"
+                            else dog["Groom Price"]
+                        ),
+                        "Minutes": (
+                            dog["Bath Minutes"]
+                            if dog["Next Service"] == "Bath"
+                            else dog["Groom Minutes"]
+                        ),
                         "Household Override Minutes": (
                             household_override if household_override > 0 else None
                         ),
@@ -2304,8 +2516,20 @@ with clients_tab:
         disabled=["Record ID"] if "Record ID" in editor_df.columns else [],
         column_config={
             "Frequency Weeks": st.column_config.NumberColumn("Frequency Weeks", min_value=1, step=1),
-            "Price": st.column_config.NumberColumn("Price", format="$%.2f"),
-            "Minutes": st.column_config.NumberColumn("Dog Minutes", min_value=15, step=15),
+            "Service Pattern": st.column_config.SelectboxColumn(
+                "Service Pattern",
+                options=["Groom only", "Bath only", "Alternate: Groom/Bath"],
+            ),
+            "Next Service": st.column_config.SelectboxColumn(
+                "Next Service",
+                options=["Groom", "Bath"],
+            ),
+            "Bath Price": st.column_config.NumberColumn("Bath Price", format="$%.2f"),
+            "Bath Minutes": st.column_config.NumberColumn("Bath Minutes", min_value=0, step=15),
+            "Groom Price": st.column_config.NumberColumn("Groom Price", format="$%.2f"),
+            "Groom Minutes": st.column_config.NumberColumn("Groom Minutes", min_value=0, step=15),
+            "Price": st.column_config.NumberColumn("Legacy Price", format="$%.2f"),
+            "Minutes": st.column_config.NumberColumn("Legacy Minutes", min_value=0, step=15),
             "Household Override Minutes": st.column_config.NumberColumn(
                 "Household Override Minutes",
                 min_value=0,
