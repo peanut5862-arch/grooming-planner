@@ -15,12 +15,12 @@ except Exception:
     create_client = None
 
 st.set_page_config(
-    page_title="Mobile Grooming Planner v15.6",
+    page_title="Mobile Grooming Planner v15.7",
     page_icon="🐾",
     layout="wide",
 )
 
-st.title("🐾 Mobile Grooming Planner v15.6")
+st.title("🐾 Mobile Grooming Planner v15.7")
 st.caption("Private client manager + due-date intelligence + cancellation filling + optional real drive-time scoring.")
 
 WORKDAYS = {
@@ -1018,6 +1018,7 @@ def build_week_plan(
     daily_capacity_minutes=420,
     max_appointments_per_day=4,
     week_overrides=None,
+    exclude_household_ids=None,
 ):
     output_columns = [
         "Household ID",
@@ -1062,9 +1063,23 @@ def build_week_plan(
         if bool(override.get("force_include", False))
     }
 
-    pool = due[
-        (due["Days Until Due"] <= 6)
+    exclude_household_ids = {
+        str(hid)
+        for hid in (exclude_household_ids or set())
+        if str(hid).strip()
+    }
+
+    # If a household is already on a recently saved earlier week, do not
+    # automatically schedule it again. A manual force-include still wins,
+    # which supports intentional reschedules.
+    eligible_due = due[
+        (~due["Household ID"].astype(str).isin(exclude_household_ids))
         | (due["Household ID"].astype(str).isin(forced_households))
+    ].copy()
+
+    pool = eligible_due[
+        (eligible_due["Days Until Due"] <= 6)
+        | (eligible_due["Household ID"].astype(str).isin(forced_households))
     ].copy()
     pool["Weekly Score"] = pool.apply(schedule_score, axis=1)
 
@@ -1673,6 +1688,53 @@ def delete_week_draft_db(week_key):
     get_supabase().table("weekly_drafts").delete().eq(
         "week_start", str(week_key)
     ).execute()
+
+
+def load_households_scheduled_before_week_db(week_key, lookback_weeks=4):
+    """
+    Return household IDs that are already placed in a saved weekly draft
+    shortly before the selected week.
+
+    This prevents a client scheduled this week from being automatically
+    suggested again when the user starts planning next week.
+    """
+    if not supabase_configured():
+        return set()
+
+    try:
+        selected_monday = pd.Timestamp(week_key).normalize()
+        lookback_start = (
+            selected_monday - pd.Timedelta(weeks=int(lookback_weeks))
+        ).date().isoformat()
+        prior_day = (
+            selected_monday - pd.Timedelta(days=1)
+        ).date().isoformat()
+
+        rows = (
+            get_supabase()
+            .table("weekly_drafts")
+            .select("week_start,plan_json")
+            .gte("week_start", lookback_start)
+            .lte("week_start", prior_day)
+            .execute()
+            .data
+            or []
+        )
+
+        scheduled = set()
+
+        for saved_week in rows:
+            for item in saved_week.get("plan_json") or []:
+                household_id = str(item.get("Household ID", "") or "").strip()
+                owner = str(item.get("Owner", "") or "").strip()
+
+                # Blank placeholder rows are not real appointments.
+                if household_id and owner:
+                    scheduled.add(household_id)
+
+        return scheduled
+    except Exception:
+        return set()
 
 def clean_scalar(value):
     if value is None:
@@ -2369,6 +2431,12 @@ with weekly_tab:
         "stored in the private database. It will not rebuild unless you tap "
         "Generate / rebuild week or Reset this week."
     )
+    if already_scheduled_households:
+        st.caption(
+            f"{len(already_scheduled_households)} household(s) already placed in a "
+            "recent saved week are being kept out of this week's automatic draft. "
+            "You can still manually add one if you intentionally need to reschedule them."
+        )
 
     week_start_input = st.date_input(
         "Week of",
@@ -2380,6 +2448,11 @@ with weekly_tab:
         days=pd.Timestamp(week_start_input).weekday()
     )
     week_key = selected_week_monday.date().isoformat()
+
+    already_scheduled_households = load_households_scheduled_before_week_db(
+        week_key,
+        lookback_weeks=4,
+    )
 
     if week_key not in st.session_state.week_client_responses:
         st.session_state.week_client_responses[week_key] = load_week_overrides_db(week_key)
@@ -2540,6 +2613,7 @@ with weekly_tab:
             daily_capacity_minutes=daily_capacity,
             max_appointments_per_day=max_appointments,
             week_overrides=week_overrides,
+            exclude_household_ids=already_scheduled_households,
         )
 
         weekly_plan = assign_times_to_weekly_plan(
@@ -2838,6 +2912,7 @@ with weekly_tab:
                         daily_capacity_minutes=daily_capacity,
                         max_appointments_per_day=max_appointments,
                         week_overrides={},
+                        exclude_household_ids=already_scheduled_households,
                     )
                     cleared_plan = assign_times_to_weekly_plan(
                         cleared_plan,
