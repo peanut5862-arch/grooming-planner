@@ -18,7 +18,7 @@ except Exception:
     create_client = None
 
 st.set_page_config(
-    page_title="Mobile Grooming Planner v30",
+    page_title="Mobile Grooming Planner v31",
     page_icon="🐾",
     layout="wide",
 )
@@ -1098,6 +1098,40 @@ def _best_timed_route_order(
 
 
 
+
+def preserve_locked_appointment_times(plan, service_buffer_minutes=0):
+    """
+    Hard guarantee: any appointment with Locked Time keeps that exact displayed
+    start time after route optimization. The end time is recalculated from the
+    saved service duration.
+    """
+    if plan is None or plan.empty or "Locked Time" not in plan.columns:
+        return plan
+
+    fixed = plan.copy()
+
+    for idx, row in fixed.iterrows():
+        locked = parse_time(row.get("Locked Time", ""))
+        if locked is None:
+            continue
+
+        duration = pd.to_numeric(
+            row.get("Minutes"),
+            errors="coerce",
+        )
+        duration = int(duration) if pd.notna(duration) else 0
+
+        fixed.at[idx, "Start Time"] = format_clock(locked)
+        fixed.at[idx, "End Time"] = format_clock(
+            add_minutes_to_time(
+                locked,
+                duration + int(service_buffer_minutes),
+            )
+        )
+
+    return fixed
+
+
 def optimize_week_with_google_maps(
     plan,
     maps_key,
@@ -1449,6 +1483,11 @@ def optimize_week_with_google_maps(
                     optimized.at[last_idx, "Drive Home After Miles"] = round(
                         return_miles, 1
                     )
+
+    optimized = preserve_locked_appointment_times(
+        optimized,
+        service_buffer_minutes=service_buffer_minutes,
+    )
 
     return optimized, routing_notes
 
@@ -2291,51 +2330,45 @@ def render_inline_week_appointment_editor(
             )
         )
 
-        time_mode = st.radio(
-            "Arrival time",
-            ["Flexible", "Exact time"],
-            index=1 if existing_lock is not None else 0,
-            horizontal=True,
-            key=f"inline_time_mode_{week_key}_{row_index}",
+        st.caption(
+            "A time you save here becomes a fixed appointment time. "
+            "Route optimization will move the other stops around it."
         )
 
-        chosen_time = default_time
-        if time_mode == "Exact time":
-            chosen_time = st.time_input(
-                "Promised arrival",
-                value=default_time,
-                key=f"inline_time_value_{week_key}_{row_index}",
-            )
+        chosen_time = st.time_input(
+            "Appointment arrival time",
+            value=default_time,
+            key=f"inline_time_value_{week_key}_{row_index}",
+        )
 
-        if st.button(
-            "Save time",
-            type="primary",
-            use_container_width=True,
-            key=f"inline_save_time_{week_key}_{row_index}",
-        ):
-            try:
-                plan = st.session_state.week_route_plans[week_key].copy()
-                if "Locked Time" not in plan.columns:
-                    plan["Locked Time"] = ""
+        t_save, t_flex = st.columns(2)
 
-                if time_mode == "Exact time":
+        with t_save:
+            if st.button(
+                "🔒 Save fixed time",
+                type="primary",
+                use_container_width=True,
+                key=f"inline_save_time_{week_key}_{row_index}",
+            ):
+                try:
+                    plan = st.session_state.week_route_plans[week_key].copy()
+                    if "Locked Time" not in plan.columns:
+                        plan["Locked Time"] = ""
+
                     plan.at[row_index, "Locked Time"] = format_clock(chosen_time)
-                else:
-                    plan.at[row_index, "Locked Time"] = ""
 
-                if maps_key:
-                    plan, notes = optimize_week_with_google_maps(
-                        plan,
-                        maps_key,
-                        jen_start=current_settings["jen_start"],
-                        haley_start=current_settings["haley_start"],
-                        service_buffer_minutes=current_settings["service_buffer"],
-                        fallback_travel_minutes=current_settings["travel_buffer"],
-                    )
-                    for note in notes:
-                        st.warning(note)
-                else:
-                    if time_mode == "Exact time":
+                    if maps_key:
+                        plan, notes = optimize_week_with_google_maps(
+                            plan,
+                            maps_key,
+                            jen_start=current_settings["jen_start"],
+                            haley_start=current_settings["haley_start"],
+                            service_buffer_minutes=current_settings["service_buffer"],
+                            fallback_travel_minutes=current_settings["travel_buffer"],
+                        )
+                        for note in notes:
+                            st.warning(note)
+                    else:
                         duration = pd.to_numeric(
                             plan.at[row_index, "Minutes"],
                             errors="coerce",
@@ -2349,21 +2382,68 @@ def render_inline_week_appointment_editor(
                             )
                         )
 
-                st.session_state.week_route_plans[week_key] = plan
-                st.session_state.week_plan_statuses[week_key] = "draft"
-                save_week_draft_db(
-                    week_key,
-                    plan,
-                    current_settings,
-                    st.session_state.week_plan_fingerprints.get(
+                    # Hard-preserve the saved fixed time even after Maps routing.
+                    plan = preserve_locked_appointment_times(
+                        plan,
+                        service_buffer_minutes=current_settings["service_buffer"],
+                    )
+
+                    st.session_state.week_route_plans[week_key] = plan
+                    st.session_state.week_plan_statuses[week_key] = "draft"
+                    save_week_draft_db(
                         week_key,
-                        schedule_data_fingerprint(st.session_state.clients),
-                    ),
-                )
-                set_week_draft_status_db(week_key, "draft")
-                st.rerun()
-            except Exception as exc:
-                st.error(f"Could not save the time change: {exc}")
+                        plan,
+                        current_settings,
+                        st.session_state.week_plan_fingerprints.get(
+                            week_key,
+                            schedule_data_fingerprint(st.session_state.clients),
+                        ),
+                    )
+                    set_week_draft_status_db(week_key, "draft")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Could not save the fixed time: {exc}")
+
+        with t_flex:
+            if st.button(
+                "Make flexible",
+                use_container_width=True,
+                disabled=existing_lock is None,
+                key=f"inline_make_flexible_{week_key}_{row_index}",
+            ):
+                try:
+                    plan = st.session_state.week_route_plans[week_key].copy()
+                    if "Locked Time" not in plan.columns:
+                        plan["Locked Time"] = ""
+                    plan.at[row_index, "Locked Time"] = ""
+
+                    if maps_key:
+                        plan, notes = optimize_week_with_google_maps(
+                            plan,
+                            maps_key,
+                            jen_start=current_settings["jen_start"],
+                            haley_start=current_settings["haley_start"],
+                            service_buffer_minutes=current_settings["service_buffer"],
+                            fallback_travel_minutes=current_settings["travel_buffer"],
+                        )
+                        for note in notes:
+                            st.warning(note)
+
+                    st.session_state.week_route_plans[week_key] = plan
+                    st.session_state.week_plan_statuses[week_key] = "draft"
+                    save_week_draft_db(
+                        week_key,
+                        plan,
+                        current_settings,
+                        st.session_state.week_plan_fingerprints.get(
+                            week_key,
+                            schedule_data_fingerprint(st.session_state.clients),
+                        ),
+                    )
+                    set_week_draft_status_db(week_key, "draft")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Could not make this time flexible: {exc}")
 
     # ----- Reschedule -----
     with action_tabs[1]:
@@ -5099,7 +5179,7 @@ if "appointments" not in st.session_state:
 
 # ---------- Sidebar: private data ----------
 
-st.sidebar.caption("Grooming Planner · v30")
+st.sidebar.caption("Grooming Planner · v31")
 st.sidebar.header("Private data")
 
 if supabase_configured():
@@ -6907,6 +6987,11 @@ with weekly_tab:
                             fallback_travel_minutes=travel_buffer,
                         )
 
+                    routed_plan = preserve_locked_appointment_times(
+                        routed_plan,
+                        service_buffer_minutes=service_buffer,
+                    )
+
                     st.session_state.week_route_plans[week_key] = routed_plan
                     st.session_state.week_plan_statuses[week_key] = "draft"
                     weekly_plan = routed_plan
@@ -6931,7 +7016,7 @@ with weekly_tab:
                         "When a groomer's private home address is configured, "
                         "the route includes home → clients → home. The groomer start "
                         "time is the ARRIVAL time at the first client, and any 🔒 exact "
-                        "appointment times are preserved while the other stops route "
+                        "fixed appointment times are preserved while the other stops route "
                         "around them. Review it, then confirm the week again."
                     )
                     st.rerun()
@@ -8234,6 +8319,6 @@ with export_tab:
         st.code('GOOGLE_MAPS_API_KEY = "your-key-here"')
 
 st.caption(
-    "Mobile Grooming Planner v30 · private Supabase data · recurring service schedules · "
+    "Mobile Grooming Planner v31 · private Supabase data · recurring service schedules · "
     "weekly/monthly planning · completion tracking · optional Google Maps routing."
 )
