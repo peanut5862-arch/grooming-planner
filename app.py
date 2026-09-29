@@ -15,12 +15,12 @@ except Exception:
     create_client = None
 
 st.set_page_config(
-    page_title="Mobile Grooming Planner v19",
+    page_title="Mobile Grooming Planner v20",
     page_icon="🐾",
     layout="wide",
 )
 
-st.title("🐾 Mobile Grooming Planner v19")
+st.title("🐾 Mobile Grooming Planner v20")
 st.caption("Private client manager + due-date intelligence + cancellation filling + optional real drive-time scoring.")
 
 WORKDAYS = {
@@ -932,12 +932,28 @@ def render_weekly_cards(valid_plan, daily_capacity, travel_buffer):
                 completed_date = str(
                     row.get("Completed Date", "") or ""
                 ).strip()
+                appointment_status = str(
+                    row.get("Appointment Status", "") or ""
+                ).strip()
+                status_note = str(
+                    row.get("Status Note", "") or ""
+                ).strip()
+
                 if completion_status == "Completed":
                     status = (
                         f"✅ Completed {completed_date}"
                         if completed_date
                         else "✅ Completed"
                     )
+                elif appointment_status == "Cancelled":
+                    status = "❌ Cancelled"
+                    if status_note:
+                        status += f" · {status_note}"
+                elif appointment_status == "Rescheduled":
+                    status = "↪️ Rescheduled"
+                    if status_note:
+                        status += f" · {status_note}"
+
                 start_time = str(row.get("Start Time", "") or "").strip()
                 end_time = str(row.get("End Time", "") or "").strip()
                 minutes = int(row.get("Minutes", 0) or 0)
@@ -1999,6 +2015,12 @@ def confirmed_service_history(up_to_date, lookback_days=1095):
 
     def apply_item(item):
         hid = str(item.get("Household ID", "") or "").strip()
+        appointment_status = str(
+            item.get("Appointment Status", "") or ""
+        ).strip()
+        if appointment_status == "Cancelled":
+            return
+
         completion_status = str(
             item.get("Completion Status", "") or ""
         ).strip()
@@ -2238,6 +2260,14 @@ def load_households_scheduled_before_week_db(week_key, lookback_weeks=4):
             for item in saved_week.get("plan_json") or []:
                 household_id = str(item.get("Household ID", "") or "").strip()
                 owner = str(item.get("Owner", "") or "").strip()
+                appointment_status = str(
+                    item.get("Appointment Status", "") or ""
+                ).strip()
+
+                # Cancelled appointments should not block the client from being
+                # scheduled on a later week.
+                if appointment_status == "Cancelled":
+                    continue
 
                 # Blank placeholder rows are not real appointments.
                 if household_id and owner:
@@ -2445,6 +2475,96 @@ def mark_week_plan_row_completed(
             current_settings,
             st.session_state.week_plan_fingerprints.get(week_key, ""),
         )
+
+    return updated_plan
+
+
+
+def update_week_appointment_status(
+    week_key,
+    plan,
+    row_index,
+    action,
+    current_settings,
+    note="",
+    new_day=None,
+    new_groomer=None,
+):
+    """
+    Update one weekly appointment without changing the client's normal cadence.
+
+    Supported actions:
+      - Cancelled
+      - Rescheduled (within the same selected week)
+      - Scheduled (restore)
+    """
+    updated_plan = plan.copy()
+
+    for col, default in [
+        ("Appointment Status", "Scheduled"),
+        ("Status Note", ""),
+    ]:
+        if col not in updated_plan.columns:
+            updated_plan[col] = default
+
+    action = str(action or "Scheduled")
+    updated_plan.at[row_index, "Appointment Status"] = action
+    updated_plan.at[row_index, "Status Note"] = str(note or "").strip()
+
+    if action == "Rescheduled":
+        day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+        if new_day not in day_names:
+            raise ValueError("Choose a Monday-Friday reschedule day.")
+
+        monday = pd.Timestamp(week_key).normalize()
+        target_date = monday + pd.Timedelta(days=day_names.index(new_day))
+
+        updated_plan.at[row_index, "Date"] = target_date.date()
+        updated_plan.at[row_index, "Day"] = new_day
+
+        if new_groomer:
+            updated_plan.at[row_index, "Groomer"] = new_groomer
+
+        updated_plan.at[row_index, "Area Cluster"] = "Rescheduled this week"
+
+    if action == "Scheduled":
+        updated_plan.at[row_index, "Status Note"] = ""
+
+    # Recalculate times so a cancellation or within-week move gives an honest
+    # view of the remaining day.
+    active_for_times = updated_plan[
+        updated_plan["Appointment Status"].fillna("Scheduled") != "Cancelled"
+    ].copy()
+
+    active_for_times = assign_times_to_weekly_plan(
+        active_for_times,
+        jen_start=current_settings["jen_start"],
+        haley_start=current_settings["haley_start"],
+        travel_buffer_minutes=current_settings["travel_buffer"],
+        service_buffer_minutes=current_settings["service_buffer"],
+    )
+
+    # Copy recalculated times back to active rows while retaining cancelled rows.
+    for active_index, active_row in active_for_times.iterrows():
+        for col in ["Start Time", "End Time"]:
+            if col in active_for_times.columns:
+                updated_plan.at[active_index, col] = active_row.get(col, "")
+
+    if action == "Cancelled":
+        updated_plan.at[row_index, "Start Time"] = ""
+        updated_plan.at[row_index, "End Time"] = ""
+
+    st.session_state.week_route_plans[week_key] = updated_plan
+    st.session_state.week_plan_statuses[week_key] = "draft"
+
+    if supabase_configured():
+        save_week_draft_db(
+            week_key,
+            updated_plan,
+            current_settings,
+            st.session_state.week_plan_fingerprints.get(week_key, ""),
+        )
+        set_week_draft_status_db(week_key, "draft")
 
     return updated_plan
 
@@ -3125,13 +3245,22 @@ with monthly_tab:
     else:
         month_only = month_plan.copy()
 
-    confirmed_appts = len(month_only)
+    if not month_only.empty:
+        if "Appointment Status" not in month_only.columns:
+            month_only["Appointment Status"] = "Scheduled"
+        month_active = month_only[
+            month_only["Appointment Status"].fillna("Scheduled") != "Cancelled"
+        ].copy()
+    else:
+        month_active = month_only.copy()
+
+    confirmed_appts = len(month_active)
     confirmed_revenue = float(
-        month_only.get("Price", pd.Series(dtype=float)).sum()
-    ) if not month_only.empty else 0.0
+        month_active.get("Price", pd.Series(dtype=float)).sum()
+    ) if not month_active.empty else 0.0
     confirmed_minutes = int(
-        month_only.get("Minutes", pd.Series(dtype=float)).sum()
-    ) if not month_only.empty else 0
+        month_active.get("Minutes", pd.Series(dtype=float)).sum()
+    ) if not month_active.empty else 0
 
     service_history = confirmed_service_history(month_end)
 
@@ -3154,11 +3283,11 @@ with monthly_tab:
         )
 
     confirmed_hids = set(
-        month_only.get("Household ID", pd.Series(dtype=str))
+        month_active.get("Household ID", pd.Series(dtype=str))
         .dropna()
         .astype(str)
         .tolist()
-    ) if not month_only.empty else set()
+    ) if not month_active.empty else set()
 
     # If a household already has a confirmed appointment somewhere in this
     # month, keep it out of the unscheduled projection list.
@@ -3299,6 +3428,12 @@ with monthly_tab:
                     completion_status = str(
                         row.get("Completion Status", "") or ""
                     ).strip()
+                    appointment_status = str(
+                        row.get("Appointment Status", "") or ""
+                    ).strip()
+                    status_note = str(
+                        row.get("Status Note", "") or ""
+                    ).strip()
 
                     details = " · ".join(
                         [part for part in [groomer, area] if part]
@@ -3308,11 +3443,17 @@ with monthly_tab:
                     )
                     dog_text = f" / {dogs}" if dogs else ""
 
-                    completed_text = (
-                        " · ✅ Completed"
-                        if completion_status == "Completed"
-                        else ""
-                    )
+                    if completion_status == "Completed":
+                        completed_text = " · ✅ Completed"
+                    elif appointment_status == "Cancelled":
+                        completed_text = " · ❌ Cancelled"
+                    elif appointment_status == "Rescheduled":
+                        completed_text = " · ↪️ Rescheduled"
+                    else:
+                        completed_text = ""
+
+                    if status_note and appointment_status in {"Cancelled", "Rescheduled"}:
+                        completed_text += f" · {status_note}"
 
                     st.markdown(
                         f"- **{time_prefix}{owner}{dog_text}**"
@@ -3711,10 +3852,20 @@ with weekly_tab:
     else:
         valid = weekly_plan[weekly_plan["Owner"] != ""].copy()
 
+        if "Appointment Status" not in valid.columns:
+            valid["Appointment Status"] = "Scheduled"
+        valid["Appointment Status"] = (
+            valid["Appointment Status"].fillna("").replace("", "Scheduled")
+        )
+
+        active_valid = valid[
+            valid["Appointment Status"] != "Cancelled"
+        ].copy()
+
         m1, m2, m3 = st.columns(3)
-        m1.metric("Appointments", len(valid))
-        m2.metric("Projected revenue", f"${valid['Price'].sum():,.0f}")
-        m3.metric("Scheduled minutes", int(valid["Minutes"].sum()))
+        m1.metric("Active appointments", len(active_valid))
+        m2.metric("Projected revenue", f"${active_valid['Price'].sum():,.0f}")
+        m3.metric("Scheduled minutes", int(active_valid["Minutes"].sum()))
 
         st.markdown("### Weekly schedule")
         render_weekly_cards(
@@ -3734,6 +3885,10 @@ with weekly_tab:
         if "Completion Status" in completion_candidates.columns:
             completion_candidates = completion_candidates[
                 completion_candidates["Completion Status"].fillna("") != "Completed"
+            ].copy()
+        if "Appointment Status" in completion_candidates.columns:
+            completion_candidates = completion_candidates[
+                completion_candidates["Appointment Status"].fillna("Scheduled") != "Cancelled"
             ].copy()
 
         if completion_candidates.empty:
@@ -3815,6 +3970,140 @@ with weekly_tab:
                     st.rerun()
                 except Exception as exc:
                     st.error(f"Could not mark this appointment completed: {exc}")
+
+        st.markdown("### Cancel or reschedule")
+        st.caption(
+            "Use this when a booked client cancels or needs a different day this week. "
+            "Changing the schedule returns the week to Draft until you confirm it again."
+        )
+
+        status_candidates = valid.copy()
+        if "Completion Status" in status_candidates.columns:
+            status_candidates = status_candidates[
+                status_candidates["Completion Status"].fillna("") != "Completed"
+            ].copy()
+
+        if status_candidates.empty:
+            st.caption("No unfinished appointments are available to change.")
+        else:
+            status_options = {}
+            for status_index, status_row in status_candidates.iterrows():
+                status_date = pd.to_datetime(
+                    status_row.get("Date"),
+                    errors="coerce",
+                )
+                status_date_label = (
+                    status_date.strftime("%a %b %d")
+                    if not pd.isna(status_date)
+                    else str(status_row.get("Date", ""))
+                )
+                status_label = (
+                    f"{status_date_label} · {status_row.get('Start Time', '')} · "
+                    f"{status_row.get('Owner', '')} / {status_row.get('Dogs', '')}"
+                )
+                status_options[status_label] = status_index
+
+            selected_status_appt = st.selectbox(
+                "Appointment to change",
+                list(status_options.keys()),
+                key=f"status_appointment_{week_key}",
+            )
+            status_row_index = status_options[selected_status_appt]
+            selected_status_row = valid.loc[status_row_index]
+
+            status_action = st.selectbox(
+                "What changed?",
+                [
+                    "Cancel appointment",
+                    "Reschedule within this week",
+                    "Restore to scheduled",
+                ],
+                key=f"status_action_{week_key}",
+            )
+
+            status_note = st.text_input(
+                "Note (optional)",
+                placeholder="Client sick, out of town, asked for Thursday, etc.",
+                key=f"status_note_{week_key}",
+            )
+
+            new_day = None
+            new_groomer = None
+
+            if status_action == "Reschedule within this week":
+                rs1, rs2 = st.columns(2)
+                with rs1:
+                    new_day = st.selectbox(
+                        "New day",
+                        ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"],
+                        key=f"reschedule_day_{week_key}",
+                    )
+                with rs2:
+                    normal_groomer = str(
+                        selected_status_row.get("Groomer", "") or ""
+                    )
+                    if normal_groomer == "Jen":
+                        reschedule_groomer_choices = ["Jen"]
+                    elif normal_groomer == "Haley":
+                        reschedule_groomer_choices = ["Haley"]
+                    else:
+                        reschedule_groomer_choices = ["Jen", "Haley"]
+
+                    new_groomer = st.selectbox(
+                        "Groomer",
+                        reschedule_groomer_choices,
+                        key=f"reschedule_groomer_{week_key}",
+                    )
+
+                if new_day not in WORKDAYS.get(new_groomer, []):
+                    st.warning(
+                        f"{new_groomer} does not normally work on {new_day}."
+                    )
+
+            if st.button(
+                "Save appointment change",
+                key=f"save_status_change_{week_key}",
+            ):
+                try:
+                    if status_action == "Cancel appointment":
+                        new_action = "Cancelled"
+                    elif status_action == "Reschedule within this week":
+                        new_action = "Rescheduled"
+                        if new_day not in WORKDAYS.get(new_groomer, []):
+                            st.error(
+                                f"{new_groomer} does not normally work on {new_day}."
+                            )
+                            st.stop()
+                    else:
+                        new_action = "Scheduled"
+
+                    weekly_plan = update_week_appointment_status(
+                        week_key,
+                        st.session_state.week_route_plans[week_key],
+                        status_row_index,
+                        new_action,
+                        current_settings,
+                        note=status_note,
+                        new_day=new_day,
+                        new_groomer=new_groomer,
+                    )
+
+                    if new_action == "Cancelled":
+                        st.success(
+                            "Cancelled. The client stays in the record, but no longer "
+                            "counts toward route time or projected revenue."
+                        )
+                    elif new_action == "Rescheduled":
+                        st.success(
+                            "Moved within this week. Review the schedule and confirm "
+                            "the week again when it looks right."
+                        )
+                    else:
+                        st.success("Appointment restored to scheduled.")
+
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Could not update appointment: {exc}")
 
         st.markdown("### Add a client to this week")
         st.caption(
@@ -4167,7 +4456,7 @@ with weekly_tab:
 
         st.markdown("#### Day summaries")
         day_summary = (
-            valid.groupby(["Date", "Day", "Groomer", "Area Cluster"], dropna=False)
+            active_valid.groupby(["Date", "Day", "Groomer", "Area Cluster"], dropna=False)
             .agg(
                 Appointments=("Owner", "count"),
                 Minutes=("Minutes", "sum"),
@@ -4193,9 +4482,9 @@ with weekly_tab:
                 if day_name not in allowed_days:
                     continue
 
-                used = valid[
-                    (valid["Date"] == day_date)
-                    & (valid["Groomer"] == groomer)
+                used = active_valid[
+                    (active_valid["Date"] == day_date)
+                    & (active_valid["Groomer"] == groomer)
                 ]["Minutes"].sum()
 
                 capacity_rows.append({
