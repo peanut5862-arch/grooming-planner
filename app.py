@@ -16,12 +16,12 @@ except Exception:
     create_client = None
 
 st.set_page_config(
-    page_title="Mobile Grooming Planner v23.1",
+    page_title="Mobile Grooming Planner v24",
     page_icon="🐾",
     layout="wide",
 )
 
-st.title("🐾 Mobile Grooming Planner v23.1")
+st.title("🐾 Mobile Grooming Planner v24")
 st.caption("Private client manager + due-date intelligence + weekly routing + real Google Maps drive-time optimization.")
 
 WORKDAYS = {
@@ -408,6 +408,120 @@ def _best_route_order(
     return best, pair_metrics, start_metrics, end_metrics
 
 
+
+def _best_timed_route_order(
+    indexes,
+    pair_metrics,
+    start_metrics,
+    end_metrics,
+    durations,
+    locked_times,
+    first_arrival_time,
+    service_buffer_minutes=0,
+    has_home=False,
+):
+    """
+    Choose the best feasible route while honoring exact appointment times.
+
+    Unlocked first stop begins at the groomer's configured first-stop arrival
+    time. A locked first stop begins at its exact locked time. For later locked
+    stops, arriving early creates waiting time; arriving late makes that route
+    order invalid.
+    """
+    indexes = list(indexes)
+    if not indexes:
+        return [], {}, None
+
+    base_first = (
+        first_arrival_time.hour * 60
+        + first_arrival_time.minute
+    )
+
+    def evaluate(order):
+        schedule = {}
+        previous = None
+        current_end = None
+        total_drive = 0.0
+        total_wait = 0.0
+
+        for position, idx in enumerate(order):
+            locked = locked_times.get(idx)
+            duration = int(durations.get(idx, 0) or 0)
+            duration += int(service_buffer_minutes)
+
+            if position == 0:
+                home_metric = start_metrics.get(idx) if has_home else None
+                if home_metric is not None:
+                    total_drive += float(home_metric[1])
+
+                earliest = base_first
+                if locked is not None:
+                    # An exact-time first appointment overrides the normal
+                    # first-stop arrival setting for that day.
+                    start_min = locked
+                else:
+                    start_min = earliest
+            else:
+                metric = pair_metrics.get((previous, idx))
+                if metric is None:
+                    return None
+                drive_min = float(metric[1])
+                total_drive += drive_min
+                earliest = current_end + drive_min
+
+                if locked is not None:
+                    # Route is impossible if travel would make us late.
+                    if earliest > locked + 0.5:
+                        return None
+                    total_wait += max(locked - earliest, 0)
+                    start_min = locked
+                else:
+                    start_min = earliest
+
+            end_min = start_min + duration
+            schedule[idx] = {
+                "start": start_min,
+                "end": end_min,
+            }
+            current_end = end_min
+            previous = idx
+
+        if has_home and order:
+            metric = end_metrics.get(order[-1])
+            if metric is None:
+                return None
+            total_drive += float(metric[1])
+            finish_with_home = current_end + float(metric[1])
+        else:
+            finish_with_home = current_end
+
+        # Primary goal: finish the full day as early as possible while meeting
+        # every exact-time promise. Then prefer less waiting and less driving.
+        score = (
+            float(finish_with_home),
+            float(total_wait),
+            float(total_drive),
+        )
+        return score, schedule
+
+    best_order = None
+    best_schedule = {}
+    best_score = None
+
+    for perm in itertools.permutations(indexes):
+        result = evaluate(perm)
+        if result is None:
+            continue
+        score, schedule = result
+        if best_score is None or score < best_score:
+            best_order = list(perm)
+            best_schedule = schedule
+            best_score = score
+
+    return best_order, best_schedule, best_score
+
+
+
 def optimize_week_with_google_maps(
     plan,
     maps_key,
@@ -434,6 +548,7 @@ def optimize_week_with_google_maps(
         ("Drive Home After Min", 0.0),
         ("Drive Home After Miles", 0.0),
         ("Leave Home Time", ""),
+        ("Locked Time", ""),
         ("Routing Mode", ""),
     ]:
         if col not in optimized.columns:
@@ -503,7 +618,7 @@ def optimize_week_with_google_maps(
 
         if routable:
             (
-                best_order,
+                _distance_order,
                 pair_metrics,
                 start_metrics,
                 end_metrics,
@@ -515,18 +630,75 @@ def optimize_week_with_google_maps(
                 end_coord=home_coord,
             )
         else:
-            best_order = []
             pair_metrics = {}
             start_metrics = {}
             end_metrics = {}
 
-        # Keep any unroutable appointment after the routable stops instead of
-        # silently dropping it.
-        final_order = list(best_order) + list(unroutable)
-
-        # The configured groomer time is ARRIVAL AT THE FIRST CLIENT,
-        # not the time they leave home.
+        # The configured groomer time is ARRIVAL AT THE FIRST CLIENT.
         first_arrival_time = jen_start if groomer == "Jen" else haley_start
+
+        durations = {}
+        locked_times = {}
+        for row_index in routable:
+            duration = pd.to_numeric(
+                optimized.at[row_index, "Minutes"],
+                errors="coerce",
+            )
+            durations[row_index] = (
+                int(duration) if pd.notna(duration) else 0
+            )
+            lock_value = optimized.at[row_index, "Locked Time"]
+            lock_minutes = locked_time_minutes(lock_value)
+            if lock_minutes is not None:
+                locked_times[row_index] = lock_minutes
+
+        if routable:
+            (
+                best_order,
+                timed_schedule,
+                timed_score,
+            ) = _best_timed_route_order(
+                routable,
+                pair_metrics,
+                start_metrics,
+                end_metrics,
+                durations,
+                locked_times,
+                first_arrival_time,
+                service_buffer_minutes=service_buffer_minutes,
+                has_home=home_coord is not None,
+            )
+
+            if best_order is None:
+                locked_names = [
+                    str(optimized.at[idx, "Owner"] or "client")
+                    for idx in routable
+                    if idx in locked_times
+                ]
+                raise ValueError(
+                    f"{groomer} on {pd.Timestamp(day_date):%A %b %d} "
+                    "cannot meet the exact appointment time(s) with the current "
+                    "clients and drive times"
+                    + (
+                        f": {', '.join(locked_names)}."
+                        if locked_names
+                        else "."
+                    )
+                )
+        else:
+            best_order = []
+            timed_schedule = {}
+
+        # Keep any unroutable appointment after the routable stops instead of
+        # silently dropping it. Exact-time locking requires a routable address.
+        for idx in unroutable:
+            if locked_time_minutes(optimized.at[idx, "Locked Time"]) is not None:
+                raise ValueError(
+                    f"{optimized.at[idx, 'Owner']} has an exact time but no "
+                    "routable address. Add/fix the address before optimizing."
+                )
+
+        final_order = list(best_order) + list(unroutable)
         current_time = first_arrival_time
         previous_idx = None
 
@@ -544,37 +716,43 @@ def optimize_week_with_google_maps(
                 metric = start_metrics.get(row_index)
                 if metric is not None:
                     drive_miles, drive_minutes = metric
-
-                # First appointment remains exactly at the configured arrival
-                # time. Work backwards to show when the groomer should leave home.
-                optimized.at[row_index, "Leave Home Time"] = format_clock(
-                    add_minutes_to_time(
-                        first_arrival_time,
-                        -int(round(drive_minutes)),
-                    )
-                )
             elif previous_idx is not None:
                 metric = pair_metrics.get((previous_idx, row_index))
                 if metric is not None:
                     drive_miles, drive_minutes = metric
 
-                # Between clients, travel happens after the prior appointment.
-                current_time = add_minutes_to_time(
-                    current_time,
-                    int(round(drive_minutes)),
+            if row_index in timed_schedule:
+                start_minutes = timed_schedule[row_index]["start"]
+                end_minutes = timed_schedule[row_index]["end"]
+                start_t = minutes_to_time(start_minutes)
+                end_t = minutes_to_time(end_minutes)
+            else:
+                # Unroutable fallback rows retain ordinary sequential timing.
+                if previous_idx is not None:
+                    current_time = add_minutes_to_time(
+                        current_time,
+                        int(round(drive_minutes)),
+                    )
+                duration = pd.to_numeric(
+                    optimized.at[row_index, "Minutes"],
+                    errors="coerce",
+                )
+                duration = int(duration) if pd.notna(duration) else 0
+                start_t = current_time
+                end_t = add_minutes_to_time(
+                    start_t,
+                    duration + int(service_buffer_minutes),
                 )
 
-            duration = pd.to_numeric(
-                optimized.at[row_index, "Minutes"],
-                errors="coerce",
-            )
-            duration = int(duration) if pd.notna(duration) else 0
-
-            start_t = current_time
-            end_t = add_minutes_to_time(
-                start_t,
-                duration + int(service_buffer_minutes),
-            )
+            # Work backward from the actual first appointment time to calculate
+            # the required leave-home time.
+            if position == 1 and home_coord is not None:
+                optimized.at[row_index, "Leave Home Time"] = format_clock(
+                    add_minutes_to_time(
+                        start_t,
+                        -int(round(drive_minutes)),
+                    )
+                )
 
             optimized.at[row_index, "Route Order"] = position
             optimized.at[row_index, "Drive From Previous Min"] = round(
@@ -1341,6 +1519,20 @@ def clock_sort_minutes(value):
         return 24 * 60 + 1
     return parsed.hour * 60 + parsed.minute
 
+
+def minutes_to_time(minutes_value):
+    """Convert minutes after midnight to a time object."""
+    total = int(round(float(minutes_value))) % (24 * 60)
+    return time(total // 60, total % 60)
+
+
+def locked_time_minutes(value):
+    """Return locked appointment time as minutes after midnight, or None."""
+    parsed = parse_time(value)
+    if parsed is None:
+        return None
+    return parsed.hour * 60 + parsed.minute
+
 def assign_times_to_weekly_plan(
     weekly_plan,
     jen_start,
@@ -1479,6 +1671,8 @@ def render_weekly_cards(valid_plan, daily_capacity, travel_buffer):
 
                 start_time = str(row.get("Start Time", "") or "").strip()
                 end_time = str(row.get("End Time", "") or "").strip()
+                locked_time = str(row.get("Locked Time", "") or "").strip()
+                lock_badge = " 🔒" if locked_time else ""
                 minutes = int(row.get("Minutes", 0) or 0)
                 price = float(row.get("Price", 0) or 0)
 
@@ -1513,7 +1707,7 @@ def render_weekly_cards(valid_plan, daily_capacity, travel_buffer):
                     )
 
                 st.markdown(
-                    f"- **{start_time}–{end_time}** · **{owner}{dog_text}** "
+                    f"- **{start_time}–{end_time}{lock_badge}** · **{owner}{dog_text}** "
                     f"· {minutes} min · ${price:,.0f}{drive_text} · {status}"
                 )
 
@@ -3930,8 +4124,11 @@ with today_tab:
                     else:
                         status_label = "Scheduled"
 
+                    locked_time = str(
+                        row.get("Locked Time", "") or ""
+                    ).strip()
                     time_text = (
-                        f"{start}–{end}"
+                        f"{start}–{end}" + (" 🔒" if locked_time else "")
                         if start or end
                         else "No time"
                     )
@@ -5165,9 +5362,9 @@ with weekly_tab:
                         "Route optimized using Google Maps drive times. "
                         "When a groomer's private home address is configured, "
                         "the route includes home → clients → home. The groomer start "
-                        "time is the ARRIVAL time at the first client; the app works "
-                        "backward to determine when to leave home. Review it, then "
-                        "confirm the week again."
+                        "time is the ARRIVAL time at the first client, and any 🔒 exact "
+                        "appointment times are preserved while the other stops route "
+                        "around them. Review it, then confirm the week again."
                     )
                     st.rerun()
 
@@ -5224,6 +5421,160 @@ with weekly_tab:
             daily_capacity=daily_capacity,
             travel_buffer=travel_buffer,
         )
+
+        st.markdown("### Exact appointment time")
+        st.caption(
+            "Lock a customer to a promised arrival time. Google Maps will route "
+            "the other appointments around it. Choose Flexible to remove the lock."
+        )
+
+        exact_time_candidates = active_valid.copy()
+        if not exact_time_candidates.empty:
+            exact_time_options = {}
+            for row_index, row in exact_time_candidates.iterrows():
+                appt_date = pd.to_datetime(row.get("Date"), errors="coerce")
+                date_label = (
+                    appt_date.strftime("%a %b %d")
+                    if not pd.isna(appt_date)
+                    else str(row.get("Date", ""))
+                )
+                current_lock = str(row.get("Locked Time", "") or "").strip()
+                lock_label = f" · 🔒 {current_lock}" if current_lock else ""
+                label = (
+                    f"{date_label} · {row.get('Owner', '')} / "
+                    f"{row.get('Dogs', '')}{lock_label}"
+                )
+                exact_time_options[label] = row_index
+
+            selected_exact = st.selectbox(
+                "Customer",
+                list(exact_time_options.keys()),
+                key=f"exact_time_client_{week_key}",
+            )
+            exact_row_index = exact_time_options[selected_exact]
+            exact_row = st.session_state.week_route_plans[week_key].loc[
+                exact_row_index
+            ]
+            existing_lock = parse_time(exact_row.get("Locked Time", ""))
+            existing_start = parse_time(exact_row.get("Start Time", ""))
+            default_exact_time = (
+                existing_lock
+                or existing_start
+                or (
+                    jen_start
+                    if str(exact_row.get("Groomer", "")) == "Jen"
+                    else haley_start
+                )
+            )
+
+            exact_mode = st.radio(
+                "Time rule",
+                ["Flexible", "Exact time"],
+                index=1 if existing_lock is not None else 0,
+                horizontal=True,
+                key=f"exact_time_mode_{week_key}_{exact_row_index}",
+            )
+
+            selected_exact_time = None
+            if exact_mode == "Exact time":
+                selected_exact_time = st.time_input(
+                    "Promised arrival time",
+                    value=default_exact_time,
+                    key=f"exact_time_value_{week_key}_{exact_row_index}",
+                )
+
+            if st.button(
+                "Save time rule",
+                key=f"save_exact_time_{week_key}",
+                use_container_width=True,
+            ):
+                try:
+                    plan_with_lock = st.session_state.week_route_plans[
+                        week_key
+                    ].copy()
+                    if "Locked Time" not in plan_with_lock.columns:
+                        plan_with_lock["Locked Time"] = ""
+
+                    if exact_mode == "Exact time":
+                        plan_with_lock.at[
+                            exact_row_index, "Locked Time"
+                        ] = format_clock(selected_exact_time)
+                    else:
+                        plan_with_lock.at[
+                            exact_row_index, "Locked Time"
+                        ] = ""
+
+                    # Re-optimize immediately when Maps is connected so the
+                    # rest of the day moves around the promised time.
+                    if maps_key:
+                        routed_plan, routing_notes = optimize_week_with_google_maps(
+                            plan_with_lock,
+                            maps_key,
+                            jen_start=jen_start,
+                            haley_start=haley_start,
+                            service_buffer_minutes=service_buffer,
+                        )
+                        plan_with_lock = routed_plan
+                        for note in routing_notes:
+                            st.warning(note)
+                    else:
+                        # Without Maps, preserve the rule in the weekly draft.
+                        # The exact route will be rebuilt once Maps optimization
+                        # is available.
+                        if exact_mode == "Exact time":
+                            duration = pd.to_numeric(
+                                plan_with_lock.at[
+                                    exact_row_index, "Minutes"
+                                ],
+                                errors="coerce",
+                            )
+                            duration = (
+                                int(duration) if pd.notna(duration) else 0
+                            )
+                            plan_with_lock.at[
+                                exact_row_index, "Start Time"
+                            ] = format_clock(selected_exact_time)
+                            plan_with_lock.at[
+                                exact_row_index, "End Time"
+                            ] = format_clock(
+                                add_minutes_to_time(
+                                    selected_exact_time,
+                                    duration + int(service_buffer),
+                                )
+                            )
+
+                    st.session_state.week_route_plans[week_key] = plan_with_lock
+                    st.session_state.week_plan_statuses[week_key] = "draft"
+                    weekly_plan = plan_with_lock
+
+                    save_week_draft_db(
+                        week_key,
+                        plan_with_lock,
+                        current_settings,
+                        st.session_state.week_plan_fingerprints.get(
+                            week_key,
+                            current_fingerprint,
+                        ),
+                    )
+                    set_week_draft_status_db(week_key, "draft")
+
+                    if exact_mode == "Exact time":
+                        st.success(
+                            f"Exact time saved for "
+                            f"{exact_row.get('Owner', '')}: "
+                            f"{format_clock(selected_exact_time)}. "
+                            "The route was adjusted around it."
+                        )
+                    else:
+                        st.success(
+                            "Time lock removed. This appointment is flexible again."
+                        )
+                    st.rerun()
+                except Exception as exc:
+                    st.error(
+                        "That exact time cannot fit the current route. "
+                        f"Try a different time or move another appointment. Details: {exc}"
+                    )
 
         st.markdown("### Complete an appointment")
         st.caption(
@@ -6850,6 +7201,6 @@ with export_tab:
         st.code('GOOGLE_MAPS_API_KEY = "your-key-here"')
 
 st.caption(
-    "Mobile Grooming Planner v23.1 · private Supabase data · recurring service schedules · "
+    "Mobile Grooming Planner v24 · private Supabase data · recurring service schedules · "
     "weekly/monthly planning · completion tracking · optional Google Maps routing."
 )
