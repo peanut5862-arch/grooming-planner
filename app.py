@@ -15,12 +15,12 @@ except Exception:
     create_client = None
 
 st.set_page_config(
-    page_title="Mobile Grooming Planner v15.5",
+    page_title="Mobile Grooming Planner v15.6",
     page_icon="🐾",
     layout="wide",
 )
 
-st.title("🐾 Mobile Grooming Planner v15.5")
+st.title("🐾 Mobile Grooming Planner v15.6")
 st.caption("Private client manager + due-date intelligence + cancellation filling + optional real drive-time scoring.")
 
 WORKDAYS = {
@@ -1554,6 +1554,126 @@ def clear_week_overrides_db(week_key):
         "week_start", str(week_key)
     ).execute()
 
+
+def _json_safe_value(value):
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    if isinstance(value, pd.Timestamp):
+        return value.isoformat()
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, time):
+        return value.strftime("%H:%M")
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except Exception:
+            pass
+    return value
+
+
+def _plan_to_json_records(plan):
+    if plan is None or plan.empty:
+        return []
+    records = []
+    for _, row in plan.iterrows():
+        records.append({
+            str(col): _json_safe_value(row.get(col))
+            for col in plan.columns
+            if not str(col).startswith("_")
+        })
+    return records
+
+
+def _settings_to_json(settings):
+    return {
+        str(key): _json_safe_value(value)
+        for key, value in (settings or {}).items()
+    }
+
+
+def save_week_draft_db(week_key, plan, settings, client_fingerprint=""):
+    """Persist the exact visible weekly draft so deploys/tab changes cannot rebuild it."""
+    if not supabase_configured():
+        return
+
+    payload = {
+        "week_start": str(week_key),
+        "plan_json": _plan_to_json_records(plan),
+        "settings_json": _settings_to_json(settings),
+        "client_fingerprint": str(client_fingerprint or ""),
+        "updated_at": datetime.utcnow().isoformat(),
+    }
+
+    (
+        get_supabase()
+        .table("weekly_drafts")
+        .upsert(payload, on_conflict="week_start")
+        .execute()
+    )
+
+
+def load_week_draft_db(week_key):
+    """Load the exact last-saved weekly draft and its builder settings."""
+    if not supabase_configured():
+        return None
+
+    try:
+        rows = (
+            get_supabase()
+            .table("weekly_drafts")
+            .select("plan_json,settings_json,client_fingerprint")
+            .eq("week_start", str(week_key))
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+        if not rows:
+            return None
+
+        saved = rows[0]
+        plan_records = saved.get("plan_json") or []
+        plan = pd.DataFrame(plan_records)
+
+        if not plan.empty and "Date" in plan.columns:
+            parsed_dates = pd.to_datetime(plan["Date"], errors="coerce")
+            plan["Date"] = parsed_dates.dt.date
+
+        for col in ["Minutes", "Price", "Score"]:
+            if not plan.empty and col in plan.columns:
+                plan[col] = pd.to_numeric(plan[col], errors="coerce").fillna(0)
+
+        settings = saved.get("settings_json") or {}
+        for key in ["jen_start", "haley_start"]:
+            if key in settings and isinstance(settings[key], str):
+                parsed = parse_time(settings[key])
+                if parsed is not None:
+                    settings[key] = parsed
+
+        return {
+            "plan": plan,
+            "settings": settings,
+            "fingerprint": saved.get("client_fingerprint") or "",
+        }
+    except Exception:
+        return None
+
+
+def delete_week_draft_db(week_key):
+    if not supabase_configured():
+        return
+    get_supabase().table("weekly_drafts").delete().eq(
+        "week_start", str(week_key)
+    ).execute()
+
 def clean_scalar(value):
     if value is None:
         return None
@@ -2244,6 +2364,11 @@ with weekly_tab:
         "Creates a Monday–Friday draft using due/overdue status, groomer workdays, "
         "appointment length, area clustering, and revenue."
     )
+    st.success(
+        "Saved-week mode: once you move or add clients, the exact weekly draft is "
+        "stored in the private database. It will not rebuild unless you tap "
+        "Generate / rebuild week or Reset this week."
+    )
 
     week_start_input = st.date_input(
         "Week of",
@@ -2259,6 +2384,15 @@ with weekly_tab:
     if week_key not in st.session_state.week_client_responses:
         st.session_state.week_client_responses[week_key] = load_week_overrides_db(week_key)
     week_overrides = st.session_state.week_client_responses[week_key]
+
+    # On a fresh Streamlit session or after a deployment, restore the exact
+    # weekly draft from Supabase instead of regenerating it from scratch.
+    if week_key not in st.session_state.week_route_plans:
+        persisted_draft = load_week_draft_db(week_key)
+        if persisted_draft is not None:
+            st.session_state.week_route_plans[week_key] = persisted_draft["plan"]
+            st.session_state.week_builder_settings[week_key] = persisted_draft["settings"]
+            st.session_state.week_plan_fingerprints[week_key] = persisted_draft["fingerprint"]
 
     default_settings = {
         "daily_capacity": 420,
@@ -2380,6 +2514,7 @@ with weekly_tab:
             st.session_state.week_client_responses[week_key] = {}
             try:
                 clear_week_overrides_db(week_key)
+                delete_week_draft_db(week_key)
             except Exception as exc:
                 st.warning(f"Could not clear saved weekly changes: {exc}")
             st.session_state.week_builder_settings[week_key] = default_settings.copy()
@@ -2417,6 +2552,18 @@ with weekly_tab:
 
         st.session_state.week_route_plans[week_key] = weekly_plan
         st.session_state.week_plan_fingerprints[week_key] = current_fingerprint
+        try:
+            save_week_draft_db(
+                week_key,
+                weekly_plan,
+                current_settings,
+                current_fingerprint,
+            )
+        except Exception as exc:
+            st.error(
+                "The week was generated, but it could not be saved permanently: "
+                f"{exc}"
+            )
     else:
         weekly_plan = st.session_state.week_route_plans[week_key].copy()
 
@@ -2426,6 +2573,18 @@ with weekly_tab:
             "Client data has changed since this weekly draft was generated. "
             "Your saved draft is still shown. Tap Generate / rebuild week when you want to update it."
         )
+
+    # Persist control choices without changing the exact schedule.
+    if week_key in st.session_state.week_route_plans:
+        try:
+            save_week_draft_db(
+                week_key,
+                st.session_state.week_route_plans[week_key],
+                current_settings,
+                st.session_state.week_plan_fingerprints.get(week_key, ""),
+            )
+        except Exception:
+            pass
 
     if weekly_plan.empty:
         st.info("No clients are currently due enough to build a week.")
@@ -2535,6 +2694,18 @@ with weekly_tab:
                 )
                 st.session_state.week_route_plans[week_key] = adjusted_plan
                 st.session_state.week_plan_fingerprints[week_key] = current_fingerprint
+                try:
+                    save_week_draft_db(
+                        week_key,
+                        adjusted_plan,
+                        current_settings,
+                        current_fingerprint,
+                    )
+                except Exception as exc:
+                    st.error(
+                        "The move was applied on screen, but the weekly draft "
+                        f"could not be saved permanently: {exc}"
+                    )
                 st.rerun()
 
         st.markdown("### Client replies / this-week changes")
@@ -2636,9 +2807,22 @@ with weekly_tab:
                         service_buffer_minutes=service_buffer,
                     )
                     st.session_state.week_route_plans[week_key] = adjusted_plan
-                    st.session_state.week_plan_fingerprints[week_key] = (
-                        schedule_data_fingerprint(st.session_state.clients)
+                    adjusted_fingerprint = schedule_data_fingerprint(
+                        st.session_state.clients
                     )
+                    st.session_state.week_plan_fingerprints[week_key] = adjusted_fingerprint
+                    try:
+                        save_week_draft_db(
+                            week_key,
+                            adjusted_plan,
+                            current_settings,
+                            adjusted_fingerprint,
+                        )
+                    except Exception as exc:
+                        st.error(
+                            "The move was applied on screen, but the weekly draft "
+                            f"could not be saved permanently: {exc}"
+                        )
                     st.rerun()
 
             with c_reply2:
@@ -2663,9 +2847,22 @@ with weekly_tab:
                         service_buffer_minutes=service_buffer,
                     )
                     st.session_state.week_route_plans[week_key] = cleared_plan
-                    st.session_state.week_plan_fingerprints[week_key] = (
-                        schedule_data_fingerprint(st.session_state.clients)
+                    cleared_fingerprint = schedule_data_fingerprint(
+                        st.session_state.clients
                     )
+                    st.session_state.week_plan_fingerprints[week_key] = cleared_fingerprint
+                    try:
+                        save_week_draft_db(
+                            week_key,
+                            cleared_plan,
+                            current_settings,
+                            cleared_fingerprint,
+                        )
+                    except Exception as exc:
+                        st.error(
+                            "The changes were cleared on screen, but the weekly draft "
+                            f"could not be saved permanently: {exc}"
+                        )
                     st.rerun()
 
             if week_overrides:
