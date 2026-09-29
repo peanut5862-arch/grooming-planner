@@ -5,6 +5,7 @@ import re
 import itertools
 import urllib.parse
 import urllib.request
+import urllib.error
 from datetime import date, datetime, time
 
 import pandas as pd
@@ -16,12 +17,12 @@ except Exception:
     create_client = None
 
 st.set_page_config(
-    page_title="Mobile Grooming Planner v24.5",
+    page_title="Mobile Grooming Planner v24.6",
     page_icon="🐾",
     layout="wide",
 )
 
-st.title("🐾 Mobile Grooming Planner v24.5")
+st.title("🐾 Mobile Grooming Planner v24.6")
 st.caption("Private client manager + due-date intelligence + weekly routing + real Google Maps drive-time optimization.")
 
 WORKDAYS = {
@@ -149,8 +150,19 @@ def get_groomer_home_coords(groomer, maps_key):
 
 def get_json(url, headers=None, data=None):
     req = urllib.request.Request(url, headers=headers or {}, data=data)
-    with urllib.request.urlopen(req, timeout=20) as response:
-        return json.loads(response.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=20) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            body = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            body = ""
+        raise RuntimeError(
+            f"Google API HTTP {exc.code}: {body[:1000]}"
+        ) from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Google API connection error: {exc}") from exc
 
 def geocode_address(full_address, key):
     params = urllib.parse.urlencode({"address": full_address, "key": key})
@@ -230,6 +242,51 @@ def route_metrics(origin, destination, key):
     return miles, minutes
 
 
+def test_google_routes_api(maps_key):
+    """Confirm that the key is really returning route mileage and time."""
+    jen_home = get_groomer_home_address("Jen")
+    haley_home = get_groomer_home_address("Haley")
+
+    if not jen_home or not haley_home:
+        raise RuntimeError(
+            "Jen and Haley home addresses must both be present in Streamlit Secrets."
+        )
+
+    payload = {
+        "origin": {"address": jen_home},
+        "destination": {"address": haley_home},
+        "travelMode": "DRIVE",
+        "routingPreference": "TRAFFIC_AWARE",
+        "units": "IMPERIAL",
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": maps_key,
+        "X-Goog-FieldMask": "routes.distanceMeters,routes.duration",
+    }
+
+    result = get_json(
+        "https://routes.googleapis.com/directions/v2:computeRoutes",
+        headers=headers,
+        data=json.dumps(payload).encode("utf-8"),
+    )
+
+    routes = result.get("routes", [])
+    if not routes:
+        raise RuntimeError("Routes API returned no route.")
+
+    route = routes[0]
+    miles = float(route.get("distanceMeters", 0) or 0) / 1609.344
+    duration = str(route.get("duration", "0s") or "0s").replace("s", "")
+    minutes = float(duration) / 60.0
+
+    if miles <= 0 or minutes <= 0:
+        raise RuntimeError("Routes API returned zero mileage/time.")
+
+    return miles, minutes
+
+
+
 def route_legs_for_sequence(points, key):
     """
     Calculate the actual Google Routes legs for one ordered day in ONE request.
@@ -276,9 +333,8 @@ def route_legs_for_sequence(points, key):
             headers=headers,
             data=json.dumps(payload).encode("utf-8"),
         )
-    except Exception:
-        # Retry without live traffic. This still returns real road mileage and
-        # average road-network travel time, and is less likely to fail.
+        st.session_state["last_google_routes_error"] = ""
+    except Exception as first_exc:
         payload["routingPreference"] = "TRAFFIC_UNAWARE"
         try:
             result = get_json(
@@ -286,7 +342,9 @@ def route_legs_for_sequence(points, key):
                 headers=headers,
                 data=json.dumps(payload).encode("utf-8"),
             )
-        except Exception:
+            st.session_state["last_google_routes_error"] = ""
+        except Exception as second_exc:
+            st.session_state["last_google_routes_error"] = str(second_exc or first_exc)
             return []
 
     routes = result.get("routes", [])
@@ -913,6 +971,15 @@ def optimize_week_with_google_maps(
             maps_key,
         )
 
+        if final_route_points and not final_leg_metrics:
+            api_error = st.session_state.get("last_google_routes_error", "")
+            routing_notes.append(
+                f"{pd.Timestamp(day_date):%a %b %d} · {groomer}: "
+                "Google Routes did not return real leg mileage/time, so this day "
+                f"is using the {int(fallback_travel_minutes)}-minute fallback."
+                + (f" API detail: {api_error}" if api_error else "")
+            )
+
         current_time = first_arrival_time
         previous_idx = None
 
@@ -1012,15 +1079,24 @@ def optimize_week_with_google_maps(
             optimized.at[row_index, "Drive From Previous Miles"] = round(
                 drive_miles, 1
             )
-            optimized.at[row_index, "Routing Mode"] = (
-                "Google Maps + Home"
-                if row_index in coords and home_coord is not None
-                else (
-                    "Google Maps"
+            if final_leg_metrics:
+                routing_mode = (
+                    "Google Maps + Home"
+                    if row_index in coords and home_coord is not None
+                    else (
+                        "Google Maps"
+                        if row_index in coords
+                        else "Address missing"
+                    )
+                )
+            else:
+                routing_mode = (
+                    "Fallback buffer"
                     if row_index in coords
                     else "Address missing"
                 )
-            )
+
+            optimized.at[row_index, "Routing Mode"] = routing_mode
             optimized.at[row_index, "Start Time"] = format_clock(start_t)
             optimized.at[row_index, "End Time"] = format_clock(end_t)
 
@@ -1956,10 +2032,9 @@ def render_weekly_cards(valid_plan, daily_capacity, travel_buffer):
                     row.get("Drive From Previous Miles"),
                     errors="coerce",
                 )
+                routing_mode = str(row.get("Routing Mode", "") or "")
                 if (
-                    str(row.get("Routing Mode", "") or "") in {
-                        "Google Maps", "Google Maps + Home"
-                    }
+                    routing_mode in {"Google Maps", "Google Maps + Home"}
                     and pd.notna(drive_minutes)
                     and float(drive_minutes) > 0
                 ):
@@ -1971,6 +2046,12 @@ def render_weekly_cards(valid_plan, daily_capacity, travel_buffer):
                             else ""
                         )
                     )
+                elif (
+                    routing_mode == "Fallback buffer"
+                    and pd.notna(drive_minutes)
+                    and float(drive_minutes) > 0
+                ):
+                    drive_text = f" · 🚗 ~{float(drive_minutes):.0f} min fallback"
 
                 st.markdown(
                     f"- **{start_time}–{end_time}{lock_badge}** · **{owner}{dog_text}** "
@@ -4166,7 +4247,35 @@ if not supabase_configured():
 maps_key = get_maps_key()
 
 if maps_key:
-    st.sidebar.success("Google Maps connected — real routing available")
+    st.sidebar.info("Google Maps key found")
+
+    if st.sidebar.button(
+        "Test Google Routes API",
+        help="Checks whether Google is actually returning real drive time and mileage.",
+    ):
+        try:
+            test_miles, test_minutes = test_google_routes_api(maps_key)
+            st.session_state["google_routes_test_ok"] = True
+            st.session_state["google_routes_test_message"] = (
+                f"Routes API working: {test_miles:.1f} mi / "
+                f"{test_minutes:.0f} min between the two saved home locations."
+            )
+        except Exception as exc:
+            st.session_state["google_routes_test_ok"] = False
+            st.session_state["google_routes_test_message"] = str(exc)
+
+    if st.session_state.get("google_routes_test_ok") is True:
+        st.sidebar.success(
+            st.session_state.get(
+                "google_routes_test_message",
+                "Routes API working",
+            )
+        )
+    elif st.session_state.get("google_routes_test_ok") is False:
+        st.sidebar.error(
+            "Routes API test failed. "
+            + st.session_state.get("google_routes_test_message", "")
+        )
 
     configured_homes = [
         groomer
@@ -4419,10 +4528,13 @@ with today_tab:
                             errors="coerce",
                         )
                         drive_detail = ""
+                        today_routing_mode = str(
+                            row.get("Routing Mode", "") or ""
+                        )
                         if (
-                            str(row.get("Routing Mode", "") or "") in {
-                            "Google Maps", "Google Maps + Home"
-                        }
+                            today_routing_mode in {
+                                "Google Maps", "Google Maps + Home"
+                            }
                             and pd.notna(drive_minutes)
                             and float(drive_minutes) > 0
                         ):
@@ -4433,6 +4545,14 @@ with today_tab:
                                     if pd.notna(drive_miles)
                                     else ""
                                 )
+                            )
+                        elif (
+                            today_routing_mode == "Fallback buffer"
+                            and pd.notna(drive_minutes)
+                            and float(drive_minutes) > 0
+                        ):
+                            drive_detail = (
+                                f" · 🚗 ~{float(drive_minutes):.0f} min fallback"
                             )
 
                         st.write(
@@ -7475,6 +7595,6 @@ with export_tab:
         st.code('GOOGLE_MAPS_API_KEY = "your-key-here"')
 
 st.caption(
-    "Mobile Grooming Planner v24.5 · private Supabase data · recurring service schedules · "
+    "Mobile Grooming Planner v24.6 · private Supabase data · recurring service schedules · "
     "weekly/monthly planning · completion tracking · optional Google Maps routing."
 )
