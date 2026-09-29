@@ -15,12 +15,12 @@ except Exception:
     create_client = None
 
 st.set_page_config(
-    page_title="Mobile Grooming Planner v14.4",
+    page_title="Mobile Grooming Planner v14.5",
     page_icon="🐾",
     layout="wide",
 )
 
-st.title("🐾 Mobile Grooming Planner v14.4")
+st.title("🐾 Mobile Grooming Planner v14.5")
 st.caption("Private client manager + due-date intelligence + cancellation filling + optional real drive-time scoring.")
 
 WORKDAYS = {
@@ -1046,9 +1046,10 @@ def build_week_plan(
     if due.empty:
         return pd.DataFrame(columns=output_columns)
 
-    # Automatic weekly planning considers overdue clients and clients due
-    # within the next three weeks.
-    pool = due[due["Days Until Due"] <= 21].copy()
+    # Automatic weekly planning is schedule-strict:
+    # only overdue clients or clients due during the selected week are eligible.
+    # This prevents pulling clients forward early and throwing off their cadence.
+    pool = due[due["Days Until Due"] <= 6].copy()
     pool["Weekly Score"] = pool.apply(schedule_score, axis=1)
 
     days = week_dates(pd.Timestamp(week_start))
@@ -1150,11 +1151,7 @@ def build_week_plan(
                         "Area Cluster": preferred_area or row["Area"],
                         "Owner": row["Owner"],
                         "Dogs": row["Dogs"],
-                        "Status": (
-                            f"{row['Status']} · route filler"
-                            if pd.notna(row["Days Until Due"]) and row["Days Until Due"] > 7
-                            else row["Status"]
-                        ),
+                        "Status": row["Status"],
                         "Minutes": int(row["Minutes"]) if pd.notna(row["Minutes"]) else 0,
                         "Price": float(row["Price"]) if pd.notna(row["Price"]) else 0,
                         "Score": int(row["Weekly Score"]),
@@ -2112,6 +2109,11 @@ def household_member_detail(dog_df, household_id):
 # ---------- Weekly route builder ----------
 
 with weekly_tab:
+    st.info(
+        "Schedule-strict mode: this builder only uses overdue clients or clients "
+        "due during the selected week. It will not pull not-due clients forward."
+    )
+
     if st.session_state.clients.empty:
         st.info(
             "No private clients are saved yet. Add dogs in Client Manager, "
