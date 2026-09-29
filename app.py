@@ -15,12 +15,12 @@ except Exception:
     create_client = None
 
 st.set_page_config(
-    page_title="Mobile Grooming Planner v15.2",
+    page_title="Mobile Grooming Planner v15.3",
     page_icon="🐾",
     layout="wide",
 )
 
-st.title("🐾 Mobile Grooming Planner v15.2")
+st.title("🐾 Mobile Grooming Planner v15.3")
 st.caption("Private client manager + due-date intelligence + cancellation filling + optional real drive-time scoring.")
 
 WORKDAYS = {
@@ -1048,16 +1048,25 @@ def build_week_plan(
     if due.empty:
         return pd.DataFrame(columns=output_columns)
 
-    # Automatic weekly planning is schedule-strict:
-    # only overdue clients or clients due during the selected week are eligible.
-    # This prevents pulling clients forward early and throwing off their cadence.
-    pool = due[due["Days Until Due"] <= 6].copy()
-    pool["Weekly Score"] = pool.apply(schedule_score, axis=1)
-
     days = week_dates(pd.Timestamp(week_start))
     scheduled_households = set()
     results = []
     week_overrides = week_overrides or {}
+
+    # Normal automatic scheduling stays strict: only overdue / due-this-week.
+    # A user can still explicitly force a client into this week without changing
+    # that client's normal recurring cadence.
+    forced_households = {
+        str(hid)
+        for hid, override in week_overrides.items()
+        if bool(override.get("force_include", False))
+    }
+
+    pool = due[
+        (due["Days Until Due"] <= 6)
+        | (due["Household ID"].astype(str).isin(forced_households))
+    ].copy()
+    pool["Weekly Score"] = pool.apply(schedule_score, axis=1)
 
     def requested_day_for(row):
         household_id = str(row.get("Household ID", "") or "")
@@ -1069,6 +1078,11 @@ def build_week_plan(
         override = week_overrides.get(household_id, {})
         return str(override.get("response_status", "") or "")
 
+    def requested_groomer_for(row):
+        household_id = str(row.get("Household ID", "") or "")
+        override = week_overrides.get(household_id, {})
+        return str(override.get("requested_groomer", "") or "")
+
     for day_ts in days:
         day_date = day_ts.date()
         day_name = day_ts.strftime("%A")
@@ -1078,11 +1092,7 @@ def build_week_plan(
                 continue
 
             groomer_pool = pool[
-                (
-                    (pool["Groomer"] == groomer)
-                    | (pool["Groomer"].astype(str).str.strip().str.lower() == "either")
-                )
-                & (~pool["Household ID"].astype(str).isin(scheduled_households))
+                (~pool["Household ID"].astype(str).isin(scheduled_households))
                 & (pool["Minutes"].notna())
             ].copy()
 
@@ -1093,6 +1103,21 @@ def build_week_plan(
                 groomer_pool["_Response Status"] = groomer_pool.apply(
                     response_status_for, axis=1
                 )
+                groomer_pool["_Requested Groomer"] = groomer_pool.apply(
+                    requested_groomer_for, axis=1
+                )
+
+                # Honor a one-week groomer choice when supplied. Otherwise use
+                # the client's normal Jen / Haley / Either rule.
+                normal_match = (
+                    (groomer_pool["Groomer"] == groomer)
+                    | (groomer_pool["Groomer"].astype(str).str.strip().str.lower() == "either")
+                )
+                forced_match = groomer_pool["_Requested Groomer"] == groomer
+                no_forced_groomer = groomer_pool["_Requested Groomer"] == ""
+                groomer_pool = groomer_pool[
+                    forced_match | (no_forced_groomer & normal_match)
+                ].copy()
 
                 # A one-week client reply overrides the ideal draft without
                 # changing the client's recurring schedule.
@@ -2424,6 +2449,95 @@ with weekly_tab:
             travel_buffer=travel_buffer,
         )
 
+        st.markdown("### Add a client to this week")
+        st.caption(
+            "Use this when someone is not in the generated draft but you want them on this week. "
+            "This is a one-week override and does not change their normal recurrence."
+        )
+
+        all_households = household_due_table(
+            st.session_state.clients,
+            pd.Timestamp(week_start_input),
+        )
+
+        if not all_households.empty:
+            manual_options = {}
+            for _, r in all_households.iterrows():
+                hid = str(r.get("Household ID", "") or "")
+                label = (
+                    f"{r.get('Owner', '')} — {r.get('Dogs', '')} "
+                    f"— {r.get('Status', '')}"
+                )
+                manual_options[label] = hid
+
+            selected_manual = st.selectbox(
+                "Client to add",
+                list(manual_options.keys()),
+                key=f"manual_add_client_{week_key}",
+            )
+            manual_hid = manual_options[selected_manual]
+            manual_row = all_households[
+                all_households["Household ID"].astype(str) == str(manual_hid)
+            ].iloc[0]
+
+            ma1, ma2 = st.columns(2)
+            with ma1:
+                manual_day = st.selectbox(
+                    "Add to day",
+                    ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"],
+                    key=f"manual_add_day_{week_key}",
+                )
+            with ma2:
+                normal_groomer = str(manual_row.get("Groomer", "") or "")
+                if normal_groomer == "Jen":
+                    groomer_choices = ["Jen"]
+                elif normal_groomer == "Haley":
+                    groomer_choices = ["Haley"]
+                else:
+                    groomer_choices = ["Jen", "Haley"]
+                manual_groomer = st.selectbox(
+                    "Groomer for this week",
+                    groomer_choices,
+                    key=f"manual_add_groomer_{week_key}",
+                )
+
+            allowed_days = WORKDAYS.get(manual_groomer, [])
+            if manual_day not in allowed_days:
+                st.warning(
+                    f"{manual_groomer} does not normally work on {manual_day}. "
+                    "Choose one of their working days."
+                )
+            elif st.button(
+                "Add client to this week",
+                type="primary",
+                key=f"manual_add_button_{week_key}",
+            ):
+                week_overrides[manual_hid] = {
+                    "response_status": "Manually added",
+                    "requested_day": manual_day,
+                    "requested_groomer": manual_groomer,
+                    "force_include": True,
+                }
+                st.session_state.week_client_responses[week_key] = week_overrides
+
+                adjusted_plan = build_week_plan(
+                    st.session_state.clients,
+                    pd.Timestamp(week_start_input),
+                    daily_capacity_minutes=daily_capacity,
+                    max_appointments_per_day=max_appointments,
+                    week_overrides=week_overrides,
+                )
+                adjusted_plan = assign_times_to_weekly_plan(
+                    adjusted_plan,
+                    jen_start=jen_start,
+                    haley_start=haley_start,
+                    travel_buffer_minutes=travel_buffer,
+                    service_buffer_minutes=service_buffer,
+                )
+                st.session_state.week_route_plans[week_key] = adjusted_plan
+                st.session_state.week_plan_fingerprints[week_key] = current_fingerprint
+                st.rerun()
+
         st.markdown("### Client replies / this-week changes")
         st.caption(
             "Use this after you text clients. A day change only affects this selected week; "
@@ -2495,9 +2609,12 @@ with weekly_tab:
             c_reply1, c_reply2 = st.columns(2)
             with c_reply1:
                 if st.button("Apply this-week change", type="primary"):
+                    previous_override = week_overrides.get(selected_hid, {})
                     week_overrides[selected_hid] = {
                         "response_status": reply_status,
                         "requested_day": requested_day,
+                        "requested_groomer": previous_override.get("requested_groomer", ""),
+                        "force_include": previous_override.get("force_include", False),
                     }
                     st.session_state.week_client_responses[week_key] = week_overrides
 
@@ -2558,12 +2675,50 @@ with weekly_tab:
                         "Dogs": dogs,
                         "Response": override.get("response_status", ""),
                         "Requested Day": override.get("requested_day", ""),
+                        "Groomer": override.get("requested_groomer", ""),
                     })
                 st.dataframe(
                     pd.DataFrame(adjustment_rows),
                     use_container_width=True,
                     hide_index=True,
                 )
+
+        # Never silently lose a due client. Show every overdue / due-this-week
+        # household that did not fit the current generated draft.
+        due_for_week = household_due_table(
+            st.session_state.clients,
+            pd.Timestamp(week_start_input),
+        )
+        due_for_week = due_for_week[
+            due_for_week["Days Until Due"].notna()
+            & (due_for_week["Days Until Due"] <= 6)
+        ].copy()
+
+        scheduled_ids = set(valid["Household ID"].astype(str).tolist())
+        skipped_ids = {
+            str(hid)
+            for hid, override in week_overrides.items()
+            if override.get("response_status") == "Skip this week"
+        }
+        unplaced_due = due_for_week[
+            ~due_for_week["Household ID"].astype(str).isin(scheduled_ids | skipped_ids)
+        ].copy()
+
+        if not unplaced_due.empty:
+            st.warning(
+                f"{len(unplaced_due)} due/overdue household(s) did not fit the current draft."
+            )
+            st.markdown("#### Due but not placed")
+            st.dataframe(
+                unplaced_due[[
+                    "Owner", "Dogs", "Area", "Groomer", "Status", "Minutes", "Price"
+                ]],
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.caption(
+                "Use Add a client to this week above to place any of these manually."
+            )
 
         with st.expander("View full weekly table"):
             st.dataframe(
