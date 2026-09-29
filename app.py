@@ -15,12 +15,12 @@ except Exception:
     create_client = None
 
 st.set_page_config(
-    page_title="Mobile Grooming Planner v20.2",
+    page_title="Mobile Grooming Planner v21",
     page_icon="🐾",
     layout="wide",
 )
 
-st.title("🐾 Mobile Grooming Planner v20.2")
+st.title("🐾 Mobile Grooming Planner v21")
 st.caption("Private client manager + due-date intelligence + cancellation filling + optional real drive-time scoring.")
 
 WORKDAYS = {
@@ -3067,10 +3067,58 @@ else:
 clients = st.session_state.clients
 appointments = st.session_state.appointments
 
+
+def get_week_plan_for_day(day_value):
+    """
+    Load the saved weekly plan that contains day_value.
+    Prefer the current session copy, otherwise restore the persisted Supabase copy.
+    """
+    day_ts = pd.Timestamp(day_value).normalize()
+    monday = day_ts - pd.Timedelta(days=day_ts.weekday())
+    week_key = monday.date().isoformat()
+
+    default_settings = {
+        "daily_capacity": 420,
+        "max_appointments": 4,
+        "jen_start": time(8, 0),
+        "haley_start": time(8, 0),
+        "travel_buffer": 20,
+        "service_buffer": 0,
+    }
+
+    plan = st.session_state.week_route_plans.get(week_key)
+    settings = st.session_state.week_builder_settings.get(week_key)
+    status = st.session_state.week_plan_statuses.get(week_key)
+
+    if plan is None:
+        saved = load_week_draft_db(week_key)
+        if saved is not None:
+            plan = saved["plan"]
+            settings = saved.get("settings") or default_settings.copy()
+            status = saved.get("status", "draft")
+
+            st.session_state.week_route_plans[week_key] = plan
+            st.session_state.week_builder_settings[week_key] = settings
+            st.session_state.week_plan_fingerprints[week_key] = saved.get(
+                "fingerprint", ""
+            )
+            st.session_state.week_plan_statuses[week_key] = status
+
+    if settings is None:
+        settings = default_settings.copy()
+        st.session_state.week_builder_settings[week_key] = settings
+
+    if plan is None:
+        plan = pd.DataFrame()
+
+    return week_key, plan.copy(), settings, status or "draft"
+
+
 # ---------- Main tabs ----------
 
-planner_tab, monthly_tab, weekly_tab, clients_tab, due_tab, export_tab = st.tabs(
+today_tab, planner_tab, monthly_tab, weekly_tab, clients_tab, due_tab, export_tab = st.tabs(
     [
+        "☀️ Today",
         "📅 Planner",
         "🗓️ Monthly Planner",
         "📆 Weekly Route Builder",
@@ -3079,6 +3127,302 @@ planner_tab, monthly_tab, weekly_tab, clients_tab, due_tab, export_tab = st.tabs
         "🔐 Private Data",
     ]
 )
+
+
+# ---------- Today ----------
+
+with today_tab:
+    st.markdown("## Today")
+    st.caption(
+        "Your mobile workday view. See the route, then mark appointments completed, "
+        "cancel them, or move them without opening the full weekly builder."
+    )
+
+    today_view_date = st.date_input(
+        "Day",
+        value=date.today(),
+        key="today_view_date",
+    )
+
+    today_week_key, today_week_plan, today_settings, today_week_status = (
+        get_week_plan_for_day(today_view_date)
+    )
+
+    if today_week_plan.empty:
+        st.info(
+            "There is no saved weekly schedule containing this day yet."
+        )
+        if st.button(
+            "Open this week in Weekly Route Builder",
+            key=f"today_open_empty_week_{today_week_key}",
+        ):
+            st.session_state["week_builder_date"] = pd.Timestamp(
+                today_week_key
+            ).date()
+            st.success(
+                f"Weekly Route Builder is set to the week of "
+                f"{pd.Timestamp(today_week_key):%b %d}. Tap that tab."
+            )
+    else:
+        today_rows = today_week_plan.copy()
+        today_dates = pd.to_datetime(
+            today_rows.get("Date"),
+            errors="coerce",
+        )
+        today_rows = today_rows[
+            today_dates.dt.date == pd.Timestamp(today_view_date).date()
+        ].copy()
+
+        if "Appointment Status" not in today_rows.columns:
+            today_rows["Appointment Status"] = "Scheduled"
+        today_rows["Appointment Status"] = (
+            today_rows["Appointment Status"]
+            .fillna("")
+            .replace("", "Scheduled")
+        )
+
+        active_today = today_rows[
+            ~today_rows["Appointment Status"].isin(
+                ["Cancelled", "Moved to another week"]
+            )
+        ].copy()
+
+        t1, t2, t3 = st.columns(3)
+        t1.metric("Appointments", len(active_today))
+        t2.metric(
+            "Revenue",
+            f"${float(active_today.get('Price', pd.Series(dtype=float)).sum()):,.0f}",
+        )
+        t3.metric(
+            "Groom min",
+            int(active_today.get("Minutes", pd.Series(dtype=float)).sum()),
+        )
+
+        if today_week_status == "confirmed":
+            st.success("This week is CONFIRMED.")
+        else:
+            st.warning(
+                "This week is still a DRAFT. Daily actions will save, but review and "
+                "confirm the week when the schedule is final."
+            )
+
+        if today_rows.empty:
+            st.info("No appointments are scheduled for this day.")
+        else:
+            today_rows["_Start Sort"] = today_rows.get(
+                "Start Time",
+                pd.Series([""] * len(today_rows), index=today_rows.index),
+            ).apply(clock_sort_minutes)
+
+            today_rows = today_rows.sort_values(
+                ["Groomer", "_Start Sort", "Owner"],
+                kind="stable",
+            )
+
+            for groomer, groomer_rows in today_rows.groupby(
+                "Groomer",
+                sort=False,
+            ):
+                st.markdown(f"### {groomer}")
+
+                for row_index, row in groomer_rows.iterrows():
+                    owner = str(row.get("Owner", "") or "").strip()
+                    dogs = str(row.get("Dogs", "") or "").strip()
+                    start = str(row.get("Start Time", "") or "").strip()
+                    end = str(row.get("End Time", "") or "").strip()
+                    area = str(row.get("Area Cluster", "") or "").strip()
+                    price = float(row.get("Price", 0) or 0)
+                    minutes = int(row.get("Minutes", 0) or 0)
+                    appointment_status = str(
+                        row.get("Appointment Status", "") or "Scheduled"
+                    ).strip()
+                    completion_status = str(
+                        row.get("Completion Status", "") or ""
+                    ).strip()
+                    completed_date = str(
+                        row.get("Completed Date", "") or ""
+                    ).strip()
+
+                    if completion_status == "Completed":
+                        status_label = "✅ Completed"
+                        if completed_date:
+                            status_label += f" {completed_date}"
+                    elif appointment_status == "Cancelled":
+                        status_label = "❌ Cancelled"
+                    elif appointment_status == "Moved to another week":
+                        moved_to = str(row.get("Rescheduled To", "") or "").strip()
+                        status_label = (
+                            f"↪️ Moved to {moved_to}"
+                            if moved_to
+                            else "↪️ Moved"
+                        )
+                    elif appointment_status == "Rescheduled":
+                        status_label = "↪️ Rescheduled"
+                    else:
+                        status_label = "Scheduled"
+
+                    time_text = (
+                        f"{start}–{end}"
+                        if start or end
+                        else "No time"
+                    )
+                    dog_text = f" / {dogs}" if dogs else ""
+
+                    with st.expander(
+                        f"{time_text} · {owner}{dog_text} · ${price:,.0f}",
+                        expanded=False,
+                    ):
+                        st.write(
+                            f"**{status_label}** · {minutes} min"
+                            + (f" · {area}" if area else "")
+                        )
+
+                        if completion_status == "Completed":
+                            st.success("This appointment is already completed.")
+                        elif appointment_status in {
+                            "Cancelled",
+                            "Moved to another week",
+                        }:
+                            st.caption(
+                                "This appointment is no longer active on this day."
+                            )
+                        else:
+                            complete_col, cancel_col = st.columns(2)
+
+                            with complete_col:
+                                if st.button(
+                                    "✅ Completed",
+                                    key=f"today_complete_{today_week_key}_{row_index}",
+                                    use_container_width=True,
+                                ):
+                                    try:
+                                        changed, missing = mark_household_services_completed(
+                                            row.get("Household ID"),
+                                            row.get("Dogs"),
+                                            today_view_date,
+                                        )
+                                        mark_week_plan_row_completed(
+                                            today_week_key,
+                                            st.session_state.week_route_plans[
+                                                today_week_key
+                                            ],
+                                            row_index,
+                                            today_view_date,
+                                            today_settings,
+                                        )
+                                        if missing:
+                                            st.warning(
+                                                "Completed, but these dog names could "
+                                                f"not be matched: {', '.join(missing)}"
+                                            )
+                                        else:
+                                            st.success(
+                                                f"Completed. Updated {changed} dog record(s)."
+                                            )
+                                        st.rerun()
+                                    except Exception as exc:
+                                        st.error(
+                                            f"Could not complete appointment: {exc}"
+                                        )
+
+                            with cancel_col:
+                                if st.button(
+                                    "❌ Cancel",
+                                    key=f"today_cancel_{today_week_key}_{row_index}",
+                                    use_container_width=True,
+                                ):
+                                    try:
+                                        update_week_appointment_status(
+                                            today_week_key,
+                                            st.session_state.week_route_plans[
+                                                today_week_key
+                                            ],
+                                            row_index,
+                                            "Cancelled",
+                                            today_settings,
+                                        )
+                                        st.success("Cancelled.")
+                                        st.rerun()
+                                    except Exception as exc:
+                                        st.error(
+                                            f"Could not cancel appointment: {exc}"
+                                        )
+
+                            new_date = st.date_input(
+                                "Reschedule to",
+                                value=(
+                                    pd.Timestamp(today_view_date)
+                                    + pd.Timedelta(days=7)
+                                ).date(),
+                                key=f"today_reschedule_date_{today_week_key}_{row_index}",
+                            )
+
+                            current_groomer = str(
+                                row.get("Groomer", "") or ""
+                            )
+                            if current_groomer == "Jen":
+                                quick_groomer_choices = ["Jen"]
+                            elif current_groomer == "Haley":
+                                quick_groomer_choices = ["Haley"]
+                            else:
+                                quick_groomer_choices = ["Jen", "Haley"]
+
+                            quick_new_groomer = st.selectbox(
+                                "Groomer",
+                                quick_groomer_choices,
+                                key=f"today_reschedule_groomer_{today_week_key}_{row_index}",
+                            )
+
+                            if st.button(
+                                "↪️ Reschedule",
+                                key=f"today_reschedule_{today_week_key}_{row_index}",
+                                use_container_width=True,
+                            ):
+                                try:
+                                    result = reschedule_appointment_to_date(
+                                        today_week_key,
+                                        st.session_state.week_route_plans[
+                                            today_week_key
+                                        ],
+                                        row_index,
+                                        new_date,
+                                        quick_new_groomer,
+                                        today_settings,
+                                    )
+                                    if result["same_week"]:
+                                        st.success(
+                                            f"Moved to {pd.Timestamp(new_date):%A, %b %d}."
+                                        )
+                                    else:
+                                        st.session_state[
+                                            "pending_week_builder_date"
+                                        ] = pd.Timestamp(
+                                            result["target_week_key"]
+                                        ).date()
+                                        st.success(
+                                            f"Moved to {pd.Timestamp(new_date):%A, %b %d}. "
+                                            "The future week was saved as Draft."
+                                        )
+                                    st.rerun()
+                                except Exception as exc:
+                                    st.error(
+                                        f"Could not reschedule appointment: {exc}"
+                                    )
+
+                st.divider()
+
+        if st.button(
+            "Open this week in Weekly Route Builder",
+            key=f"today_open_week_{today_week_key}",
+        ):
+            st.session_state["week_builder_date"] = pd.Timestamp(
+                today_week_key
+            ).date()
+            st.success(
+                f"Weekly Route Builder is set to the week of "
+                f"{pd.Timestamp(today_week_key):%b %d}. Tap that tab."
+            )
+
 
 # ---------- Planner ----------
 
