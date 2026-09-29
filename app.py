@@ -15,12 +15,12 @@ except Exception:
     create_client = None
 
 st.set_page_config(
-    page_title="Mobile Grooming Planner v20",
+    page_title="Mobile Grooming Planner v20.1",
     page_icon="🐾",
     layout="wide",
 )
 
-st.title("🐾 Mobile Grooming Planner v20")
+st.title("🐾 Mobile Grooming Planner v20.1")
 st.caption("Private client manager + due-date intelligence + cancellation filling + optional real drive-time scoring.")
 
 WORKDAYS = {
@@ -951,6 +951,15 @@ def render_weekly_cards(valid_plan, daily_capacity, travel_buffer):
                         status += f" · {status_note}"
                 elif appointment_status == "Rescheduled":
                     status = "↪️ Rescheduled"
+                    if status_note:
+                        status += f" · {status_note}"
+                elif appointment_status == "Moved to another week":
+                    moved_to = str(row.get("Rescheduled To", "") or "").strip()
+                    status = (
+                        f"↪️ Moved to {moved_to}"
+                        if moved_to
+                        else "↪️ Moved to another week"
+                    )
                     if status_note:
                         status += f" · {status_note}"
 
@@ -2018,7 +2027,7 @@ def confirmed_service_history(up_to_date, lookback_days=1095):
         appointment_status = str(
             item.get("Appointment Status", "") or ""
         ).strip()
-        if appointment_status == "Cancelled":
+        if appointment_status in {"Cancelled", "Moved to another week"}:
             return
 
         completion_status = str(
@@ -2266,7 +2275,7 @@ def load_households_scheduled_before_week_db(week_key, lookback_weeks=4):
 
                 # Cancelled appointments should not block the client from being
                 # scheduled on a later week.
-                if appointment_status == "Cancelled":
+                if appointment_status in {"Cancelled", "Moved to another week"}:
                     continue
 
                 # Blank placeholder rows are not real appointments.
@@ -2567,6 +2576,212 @@ def update_week_appointment_status(
         set_week_draft_status_db(week_key, "draft")
 
     return updated_plan
+
+
+
+def reschedule_appointment_to_date(
+    source_week_key,
+    source_plan,
+    row_index,
+    target_date,
+    target_groomer,
+    source_settings,
+    note="",
+):
+    """
+    Move one appointment to a specific date, including a future week.
+
+    The source week keeps a visible "Moved to another week" history row.
+    The destination week receives the real scheduled appointment and is saved
+    as a Draft until the user reviews and confirms it.
+    """
+    target_ts = pd.Timestamp(target_date).normalize()
+    target_day = target_ts.strftime("%A")
+
+    if target_day not in {"Monday", "Tuesday", "Wednesday", "Thursday", "Friday"}:
+        raise ValueError("Choose a Monday-Friday date.")
+
+    if target_day not in WORKDAYS.get(target_groomer, []):
+        raise ValueError(f"{target_groomer} does not normally work on {target_day}.")
+
+    source_monday = pd.Timestamp(source_week_key).normalize()
+    target_monday = target_ts - pd.Timedelta(days=target_ts.weekday())
+    target_week_key = target_monday.date().isoformat()
+
+    # Same-week move can use the existing reschedule function.
+    if target_week_key == str(source_week_key):
+        return {
+            "same_week": True,
+            "source_plan": update_week_appointment_status(
+                source_week_key,
+                source_plan,
+                row_index,
+                "Rescheduled",
+                source_settings,
+                note=note,
+                new_day=target_day,
+                new_groomer=target_groomer,
+            ),
+            "target_week_key": target_week_key,
+        }
+
+    source_updated = source_plan.copy()
+    for col, default in [
+        ("Appointment Status", "Scheduled"),
+        ("Status Note", ""),
+        ("Rescheduled To", ""),
+    ]:
+        if col not in source_updated.columns:
+            source_updated[col] = default
+
+    moving_row = source_updated.loc[row_index].copy()
+
+    source_updated.at[row_index, "Appointment Status"] = "Moved to another week"
+    source_updated.at[row_index, "Status Note"] = str(note or "").strip()
+    source_updated.at[row_index, "Rescheduled To"] = target_ts.date().isoformat()
+    source_updated.at[row_index, "Start Time"] = ""
+    source_updated.at[row_index, "End Time"] = ""
+
+    # Re-time only appointments that remain active in the source week.
+    source_active = source_updated[
+        ~source_updated["Appointment Status"]
+        .fillna("Scheduled")
+        .isin(["Cancelled", "Moved to another week"])
+    ].copy()
+
+    source_active = assign_times_to_weekly_plan(
+        source_active,
+        jen_start=source_settings["jen_start"],
+        haley_start=source_settings["haley_start"],
+        travel_buffer_minutes=source_settings["travel_buffer"],
+        service_buffer_minutes=source_settings["service_buffer"],
+    )
+
+    for active_index, active_row in source_active.iterrows():
+        for col in ["Start Time", "End Time"]:
+            if col in source_active.columns:
+                source_updated.at[active_index, col] = active_row.get(col, "")
+
+    st.session_state.week_route_plans[source_week_key] = source_updated
+    st.session_state.week_plan_statuses[source_week_key] = "draft"
+
+    if supabase_configured():
+        save_week_draft_db(
+            source_week_key,
+            source_updated,
+            source_settings,
+            st.session_state.week_plan_fingerprints.get(source_week_key, ""),
+        )
+        set_week_draft_status_db(source_week_key, "draft")
+
+    # Load destination week if it already exists.
+    destination_plan = st.session_state.week_route_plans.get(target_week_key)
+    destination_settings = st.session_state.week_builder_settings.get(target_week_key)
+
+    if destination_plan is None:
+        persisted = load_week_draft_db(target_week_key)
+        if persisted is not None:
+            destination_plan = persisted["plan"]
+            destination_settings = persisted.get("settings") or None
+            st.session_state.week_plan_fingerprints[target_week_key] = (
+                persisted.get("fingerprint") or ""
+            )
+        else:
+            destination_plan = pd.DataFrame(columns=source_updated.columns)
+
+    if destination_settings is None:
+        destination_settings = {
+            "daily_capacity": source_settings.get("daily_capacity", 420),
+            "max_appointments": source_settings.get("max_appointments", 4),
+            "jen_start": source_settings.get("jen_start", time(8, 0)),
+            "haley_start": source_settings.get("haley_start", time(8, 0)),
+            "travel_buffer": source_settings.get("travel_buffer", 20),
+            "service_buffer": source_settings.get("service_buffer", 0),
+        }
+
+    st.session_state.week_builder_settings[target_week_key] = destination_settings
+
+    # Prepare the destination appointment.
+    moved = moving_row.to_dict()
+    moved["Date"] = target_ts.date()
+    moved["Day"] = target_day
+    moved["Groomer"] = target_groomer
+    moved["Appointment Status"] = "Scheduled"
+    moved["Status Note"] = (
+        f"Rescheduled from {pd.Timestamp(moving_row.get('Date')):%b %d}"
+        + (f" · {note}" if str(note or "").strip() else "")
+    )
+    moved["Rescheduled To"] = ""
+    moved["Completion Status"] = ""
+    moved["Completed Date"] = ""
+    moved["Start Time"] = ""
+    moved["End Time"] = ""
+
+    if destination_plan is None or destination_plan.empty:
+        destination_plan = pd.DataFrame([moved])
+    else:
+        destination_plan = destination_plan.copy()
+        for col in moved.keys():
+            if col not in destination_plan.columns:
+                destination_plan[col] = ""
+
+        hid = str(moved.get("Household ID", "") or "")
+        existing_mask = destination_plan["Household ID"].astype(str).eq(hid)
+
+        if existing_mask.any():
+            existing_index = destination_plan[existing_mask].index[0]
+            for col, value in moved.items():
+                destination_plan.at[existing_index, col] = value
+        else:
+            destination_plan = pd.concat(
+                [destination_plan, pd.DataFrame([moved])],
+                ignore_index=True,
+            )
+
+    # Re-time destination week.
+    destination_active = destination_plan[
+        ~destination_plan.get(
+            "Appointment Status",
+            pd.Series(["Scheduled"] * len(destination_plan), index=destination_plan.index),
+        )
+        .fillna("Scheduled")
+        .isin(["Cancelled", "Moved to another week"])
+    ].copy()
+
+    destination_active = assign_times_to_weekly_plan(
+        destination_active,
+        jen_start=destination_settings["jen_start"],
+        haley_start=destination_settings["haley_start"],
+        travel_buffer_minutes=destination_settings["travel_buffer"],
+        service_buffer_minutes=destination_settings["service_buffer"],
+    )
+
+    for active_index, active_row in destination_active.iterrows():
+        for col in ["Start Time", "End Time"]:
+            if col in destination_active.columns:
+                destination_plan.at[active_index, col] = active_row.get(col, "")
+
+    st.session_state.week_route_plans[target_week_key] = destination_plan
+    st.session_state.week_plan_statuses[target_week_key] = "draft"
+    st.session_state.week_plan_fingerprints[target_week_key] = schedule_data_fingerprint(
+        st.session_state.clients
+    )
+
+    if supabase_configured():
+        save_week_draft_db(
+            target_week_key,
+            destination_plan,
+            destination_settings,
+            st.session_state.week_plan_fingerprints[target_week_key],
+        )
+        set_week_draft_status_db(target_week_key, "draft")
+
+    return {
+        "same_week": False,
+        "source_plan": source_updated,
+        "destination_plan": destination_plan,
+        "target_week_key": target_week_key,
+    }
 
 
 def dogs_db_to_app(rows):
@@ -3249,7 +3464,9 @@ with monthly_tab:
         if "Appointment Status" not in month_only.columns:
             month_only["Appointment Status"] = "Scheduled"
         month_active = month_only[
-            month_only["Appointment Status"].fillna("Scheduled") != "Cancelled"
+            ~month_only["Appointment Status"]
+            .fillna("Scheduled")
+            .isin(["Cancelled", "Moved to another week"])
         ].copy()
     else:
         month_active = month_only.copy()
@@ -3449,10 +3666,19 @@ with monthly_tab:
                         completed_text = " · ❌ Cancelled"
                     elif appointment_status == "Rescheduled":
                         completed_text = " · ↪️ Rescheduled"
+                    elif appointment_status == "Moved to another week":
+                        moved_to = str(row.get("Rescheduled To", "") or "").strip()
+                        completed_text = (
+                            f" · ↪️ Moved to {moved_to}"
+                            if moved_to
+                            else " · ↪️ Moved to another week"
+                        )
                     else:
                         completed_text = ""
 
-                    if status_note and appointment_status in {"Cancelled", "Rescheduled"}:
+                    if status_note and appointment_status in {
+                        "Cancelled", "Rescheduled", "Moved to another week"
+                    }:
                         completed_text += f" · {status_note}"
 
                     st.markdown(
@@ -3859,7 +4085,9 @@ with weekly_tab:
         )
 
         active_valid = valid[
-            valid["Appointment Status"] != "Cancelled"
+            ~valid["Appointment Status"].isin(
+                ["Cancelled", "Moved to another week"]
+            )
         ].copy()
 
         m1, m2, m3 = st.columns(3)
@@ -3888,7 +4116,9 @@ with weekly_tab:
             ].copy()
         if "Appointment Status" in completion_candidates.columns:
             completion_candidates = completion_candidates[
-                completion_candidates["Appointment Status"].fillna("Scheduled") != "Cancelled"
+                ~completion_candidates["Appointment Status"]
+                .fillna("Scheduled")
+                .isin(["Cancelled", "Moved to another week"])
             ].copy()
 
         if completion_candidates.empty:
@@ -3973,14 +4203,19 @@ with weekly_tab:
 
         st.markdown("### Cancel or reschedule")
         st.caption(
-            "Use this when a booked client cancels or needs a different day this week. "
-            "Changing the schedule returns the week to Draft until you confirm it again."
+            "Choose an exact date. You can move the appointment later this week "
+            "or to a completely different future week."
         )
 
         status_candidates = valid.copy()
         if "Completion Status" in status_candidates.columns:
             status_candidates = status_candidates[
                 status_candidates["Completion Status"].fillna("") != "Completed"
+            ].copy()
+        if "Appointment Status" in status_candidates.columns:
+            status_candidates = status_candidates[
+                status_candidates["Appointment Status"]
+                .fillna("Scheduled") != "Moved to another week"
             ].copy()
 
         if status_candidates.empty:
@@ -4015,7 +4250,7 @@ with weekly_tab:
                 "What changed?",
                 [
                     "Cancel appointment",
-                    "Reschedule within this week",
+                    "Reschedule to another date",
                     "Restore to scheduled",
                 ],
                 key=f"status_action_{week_key}",
@@ -4023,21 +4258,34 @@ with weekly_tab:
 
             status_note = st.text_input(
                 "Note (optional)",
-                placeholder="Client sick, out of town, asked for Thursday, etc.",
+                placeholder="Client sick, out of town, requested another date, etc.",
                 key=f"status_note_{week_key}",
             )
 
-            new_day = None
+            new_date = None
             new_groomer = None
 
-            if status_action == "Reschedule within this week":
+            if status_action == "Reschedule to another date":
+                original_date = pd.to_datetime(
+                    selected_status_row.get("Date"),
+                    errors="coerce",
+                )
+                if pd.isna(original_date):
+                    original_date = pd.Timestamp(date.today())
+
+                suggested_date = (
+                    original_date + pd.Timedelta(days=7)
+                ).date()
+
                 rs1, rs2 = st.columns(2)
+
                 with rs1:
-                    new_day = st.selectbox(
-                        "New day",
-                        ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"],
-                        key=f"reschedule_day_{week_key}",
+                    new_date = st.date_input(
+                        "New appointment date",
+                        value=suggested_date,
+                        key=f"reschedule_date_{week_key}_{status_row_index}",
                     )
+
                 with rs2:
                     normal_groomer = str(
                         selected_status_row.get("Groomer", "") or ""
@@ -4055,10 +4303,24 @@ with weekly_tab:
                         key=f"reschedule_groomer_{week_key}",
                     )
 
-                if new_day not in WORKDAYS.get(new_groomer, []):
+                selected_day_name = pd.Timestamp(new_date).strftime("%A")
+                if selected_day_name in {"Saturday", "Sunday"}:
+                    st.warning("Choose a Monday-Friday appointment date.")
+                elif selected_day_name not in WORKDAYS.get(new_groomer, []):
                     st.warning(
-                        f"{new_groomer} does not normally work on {new_day}."
+                        f"{new_groomer} does not normally work on {selected_day_name}."
                     )
+                else:
+                    target_monday = (
+                        pd.Timestamp(new_date)
+                        - pd.Timedelta(days=pd.Timestamp(new_date).weekday())
+                    )
+                    if target_monday.date().isoformat() != week_key:
+                        st.info(
+                            f"This will move the appointment into the week of "
+                            f"{target_monday:%b %d}. That destination week will be saved "
+                            "as a Draft for you to review and confirm."
+                        )
 
             if st.button(
                 "Save appointment change",
@@ -4066,42 +4328,68 @@ with weekly_tab:
             ):
                 try:
                     if status_action == "Cancel appointment":
-                        new_action = "Cancelled"
-                    elif status_action == "Reschedule within this week":
-                        new_action = "Rescheduled"
-                        if new_day not in WORKDAYS.get(new_groomer, []):
+                        weekly_plan = update_week_appointment_status(
+                            week_key,
+                            st.session_state.week_route_plans[week_key],
+                            status_row_index,
+                            "Cancelled",
+                            current_settings,
+                            note=status_note,
+                        )
+                        st.success(
+                            "Cancelled. It no longer counts toward route time or revenue."
+                        )
+
+                    elif status_action == "Reschedule to another date":
+                        selected_day_name = pd.Timestamp(new_date).strftime("%A")
+                        if selected_day_name in {"Saturday", "Sunday"}:
+                            st.error("Choose a Monday-Friday appointment date.")
+                            st.stop()
+                        if selected_day_name not in WORKDAYS.get(new_groomer, []):
                             st.error(
-                                f"{new_groomer} does not normally work on {new_day}."
+                                f"{new_groomer} does not normally work on {selected_day_name}."
                             )
                             st.stop()
-                    else:
-                        new_action = "Scheduled"
 
-                    weekly_plan = update_week_appointment_status(
-                        week_key,
-                        st.session_state.week_route_plans[week_key],
-                        status_row_index,
-                        new_action,
-                        current_settings,
-                        note=status_note,
-                        new_day=new_day,
-                        new_groomer=new_groomer,
-                    )
+                        result = reschedule_appointment_to_date(
+                            week_key,
+                            st.session_state.week_route_plans[week_key],
+                            status_row_index,
+                            new_date,
+                            new_groomer,
+                            current_settings,
+                            note=status_note,
+                        )
+                        weekly_plan = result["source_plan"]
 
-                    if new_action == "Cancelled":
-                        st.success(
-                            "Cancelled. The client stays in the record, but no longer "
-                            "counts toward route time or projected revenue."
-                        )
-                    elif new_action == "Rescheduled":
-                        st.success(
-                            "Moved within this week. Review the schedule and confirm "
-                            "the week again when it looks right."
-                        )
+                        if result["same_week"]:
+                            st.success(
+                                f"Moved to {pd.Timestamp(new_date):%A, %b %d}. "
+                                "Review and confirm this week again."
+                            )
+                        else:
+                            st.session_state["week_builder_date"] = pd.Timestamp(
+                                result["target_week_key"]
+                            ).date()
+                            st.success(
+                                f"Moved to {pd.Timestamp(new_date):%A, %b %d}. "
+                                f"The week of {pd.Timestamp(result['target_week_key']):%b %d} "
+                                "is now a Draft. Open that week, review it, and confirm it."
+                            )
+
                     else:
+                        weekly_plan = update_week_appointment_status(
+                            week_key,
+                            st.session_state.week_route_plans[week_key],
+                            status_row_index,
+                            "Scheduled",
+                            current_settings,
+                            note="",
+                        )
                         st.success("Appointment restored to scheduled.")
 
                     st.rerun()
+
                 except Exception as exc:
                     st.error(f"Could not update appointment: {exc}")
 
