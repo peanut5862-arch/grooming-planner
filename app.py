@@ -15,12 +15,12 @@ except Exception:
     create_client = None
 
 st.set_page_config(
-    page_title="Mobile Grooming Planner v18.2",
+    page_title="Mobile Grooming Planner v18.3",
     page_icon="🐾",
     layout="wide",
 )
 
-st.title("🐾 Mobile Grooming Planner v18.2")
+st.title("🐾 Mobile Grooming Planner v18.3")
 st.caption("Private client manager + due-date intelligence + cancellation filling + optional real drive-time scoring.")
 
 WORKDAYS = {
@@ -1946,6 +1946,16 @@ def confirmed_service_history(up_to_date, lookback_days=1095):
                 if prior is None or appt_date > prior:
                     history[key] = appt_date
 
+                # A full groom includes a bath. So when a confirmed Groom is
+                # completed, it must also reset that dog's Bath clock.
+                # Otherwise an old Last Bath date can incorrectly project a bath
+                # only 1-2 weeks after the dog was just fully groomed.
+                if service == "Groom":
+                    bath_key = (hid, dog_name.casefold(), "Bath")
+                    prior_bath = history.get(bath_key)
+                    if prior_bath is None or appt_date > prior_bath:
+                        history[bath_key] = appt_date
+
     return history
 
 
@@ -2957,7 +2967,7 @@ with monthly_tab:
     st.caption(
         f"Confirmed groom time: {confirmed_minutes} min · "
         f"Projected unscheduled time: {projected_minutes} min. "
-        "Projections use each dog's recurring cadence and restart from the latest confirmed Bath/Groom appointment when one exists."
+        "Projections use each dog's recurring cadence. A confirmed full groom resets both the Groom and Bath clocks, because the groom includes the bath."
     )
 
     st.markdown("### Confirmed schedule")
