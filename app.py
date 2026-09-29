@@ -3,6 +3,7 @@ import os
 import json
 import re
 import itertools
+import html
 import urllib.parse
 import urllib.request
 import urllib.error
@@ -17,7 +18,7 @@ except Exception:
     create_client = None
 
 st.set_page_config(
-    page_title="Mobile Grooming Planner v25",
+    page_title="Mobile Grooming Planner v26",
     page_icon="🐾",
     layout="wide",
 )
@@ -27,210 +28,321 @@ st.markdown(
     """
     <style>
     :root {
-        --gp-ink: #172033;
-        --gp-muted: #667085;
-        --gp-border: #E7EAF0;
-        --gp-soft: #F7F8FA;
-        --gp-accent: #243B64;
-        --gp-accent-soft: #EEF3FA;
+        --navy: #18243D;
+        --navy-2: #243556;
+        --ink: #1E2738;
+        --muted: #6F7787;
+        --line: #E7E8EC;
+        --canvas: #F7F5F1;
+        --paper: #FFFFFF;
+        --warm: #F0EBE3;
+        --sage: #E6EEE8;
+        --sage-ink: #45604C;
+        --blue-soft: #E9EEF7;
+        --blue-ink: #344F7B;
+        --gold-soft: #F4EEDF;
+        --gold-ink: #745D2F;
+        --rose-soft: #F4E7E7;
+        --rose-ink: #805454;
+        --shadow: 0 8px 24px rgba(24,36,61,.06);
     }
 
-    /* Overall page */
+    html, body, [class*="css"] {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
     .stApp {
-        background: #FFFFFF;
-        color: var(--gp-ink);
+        background: var(--canvas);
+        color: var(--ink);
     }
 
     .block-container {
-        padding-top: 1.4rem;
-        padding-bottom: 4rem;
-        max-width: 1180px;
+        max-width: 1120px;
+        padding-top: 1rem;
+        padding-bottom: 5rem;
     }
 
-    /* Hide Streamlit chrome clutter */
-    #MainMenu {visibility: hidden;}
-    footer {visibility: hidden;}
+    #MainMenu, footer {visibility: hidden;}
 
-    /* Main app header */
-    .gp-app-title {
+    /* Brand shell */
+    .gp-hero {
+        background: linear-gradient(135deg, var(--navy) 0%, var(--navy-2) 100%);
+        border-radius: 22px;
+        padding: 1.15rem 1.25rem 1rem 1.25rem;
+        margin: 0 0 .85rem 0;
+        box-shadow: var(--shadow);
+    }
+    .gp-eyebrow {
+        color: rgba(255,255,255,.64);
+        font-size: .68rem;
+        letter-spacing: .15em;
+        text-transform: uppercase;
+        font-weight: 700;
+        margin-bottom: .22rem;
+    }
+    .gp-title {
+        color: #fff;
         font-size: 1.7rem;
-        line-height: 1.15;
-        font-weight: 750;
-        letter-spacing: -0.025em;
-        margin: 0 0 .15rem 0;
-        color: var(--gp-ink);
+        line-height: 1.08;
+        font-weight: 780;
+        letter-spacing: -.035em;
+        margin: 0;
+    }
+    .gp-subtitle {
+        color: rgba(255,255,255,.72);
+        font-size: .82rem;
+        margin-top: .28rem;
     }
 
-    .gp-app-subtitle {
-        font-size: .88rem;
-        color: var(--gp-muted);
-        margin-bottom: 1rem;
-    }
-
-    /* Headings */
-    h1, h2, h3, h4 {
-        color: var(--gp-ink);
-        letter-spacing: -0.018em;
-    }
-
-    h2 {
-        font-size: 1.45rem !important;
-        margin-top: .7rem !important;
-        margin-bottom: .45rem !important;
-    }
-
-    h3 {
-        font-size: 1.08rem !important;
-        margin-top: .85rem !important;
-        margin-bottom: .35rem !important;
-    }
-
-    /* Tabs become compact pill navigation */
-    button[data-baseweb="tab"] {
-        border-radius: 999px;
-        padding: .48rem .72rem !important;
-        min-height: 40px;
-        white-space: nowrap;
-        font-size: .86rem;
-    }
-
+    /* Navigation */
     div[data-baseweb="tab-list"] {
-        gap: .3rem;
+        gap: .35rem;
         overflow-x: auto;
         scrollbar-width: none;
-        padding-bottom: .2rem;
+        padding: .12rem .08rem .55rem .08rem;
     }
-
-    div[data-baseweb="tab-list"]::-webkit-scrollbar {
-        display: none;
+    div[data-baseweb="tab-list"]::-webkit-scrollbar {display:none;}
+    button[data-baseweb="tab"] {
+        background: rgba(255,255,255,.72);
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        padding: .48rem .78rem !important;
+        min-height: 39px;
+        white-space: nowrap;
+        font-size: .82rem;
+        color: var(--muted);
+        box-shadow: 0 2px 8px rgba(24,36,61,.025);
     }
-
     button[data-baseweb="tab"][aria-selected="true"] {
-        background: var(--gp-accent-soft);
-        color: var(--gp-accent);
+        background: var(--navy);
+        border-color: var(--navy);
+        color: #fff;
         font-weight: 700;
     }
+    div[data-baseweb="tab-highlight"] {display:none;}
 
-    /* Metric cards */
-    div[data-testid="stMetric"] {
-        background: var(--gp-soft);
-        border: 1px solid var(--gp-border);
+    /* Typography */
+    h1, h2, h3, h4 {
+        color: var(--ink);
+        letter-spacing: -.025em;
+    }
+    h2 {
+        font-size: 1.35rem !important;
+        margin-top: .75rem !important;
+        margin-bottom: .28rem !important;
+    }
+    h3 {
+        font-size: 1.03rem !important;
+        margin-top: .8rem !important;
+        margin-bottom: .3rem !important;
+    }
+
+    /* Section banners */
+    .gp-sectionbar {
+        display:flex;
+        align-items:center;
+        justify-content:space-between;
+        gap:.6rem;
+        background: var(--paper);
+        border: 1px solid var(--line);
         border-radius: 14px;
-        padding: .8rem .85rem;
+        padding: .62rem .78rem;
+        margin: .72rem 0 .45rem 0;
+        box-shadow: 0 3px 12px rgba(24,36,61,.035);
+    }
+    .gp-sectionbar-name {
+        font-size: .9rem;
+        font-weight: 750;
+        color: var(--navy);
+    }
+    .gp-sectionbar-note {
+        font-size: .72rem;
+        color: var(--muted);
     }
 
+    /* Metrics */
+    div[data-testid="stMetric"] {
+        background: var(--paper);
+        border: 1px solid var(--line);
+        border-radius: 15px;
+        padding: .72rem .78rem;
+        box-shadow: 0 4px 14px rgba(24,36,61,.04);
+    }
     div[data-testid="stMetricLabel"] {
-        font-size: .76rem;
-        color: var(--gp-muted);
+        font-size: .7rem;
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: .055em;
+        font-weight: 650;
     }
-
     div[data-testid="stMetricValue"] {
-        font-size: 1.28rem;
-        color: var(--gp-ink);
+        color: var(--navy);
+        font-size: 1.22rem;
+        font-weight: 760;
     }
 
-    /* Alerts / status boxes */
+    /* Appointment card used by Week */
+    .gp-appt {
+        background: var(--paper);
+        border: 1px solid var(--line);
+        border-radius: 15px;
+        padding: .72rem .78rem;
+        margin: .38rem 0;
+        box-shadow: 0 3px 12px rgba(24,36,61,.035);
+    }
+    .gp-appt-top {
+        display:flex;
+        justify-content:space-between;
+        gap:.65rem;
+        align-items:flex-start;
+    }
+    .gp-appt-time {
+        display:inline-block;
+        background: var(--navy);
+        color:#fff;
+        border-radius:999px;
+        padding:.22rem .52rem;
+        font-size:.73rem;
+        font-weight:750;
+        white-space:nowrap;
+    }
+    .gp-appt-name {
+        font-size:.92rem;
+        font-weight:760;
+        color:var(--ink);
+        line-height:1.2;
+    }
+    .gp-appt-dogs {
+        font-size:.76rem;
+        color:var(--muted);
+        margin-top:.12rem;
+    }
+    .gp-appt-meta {
+        display:flex;
+        flex-wrap:wrap;
+        gap:.3rem .5rem;
+        margin-top:.48rem;
+        font-size:.72rem;
+        color:var(--muted);
+    }
+    .gp-chip {
+        display:inline-block;
+        padding:.18rem .42rem;
+        border-radius:999px;
+        background:var(--warm);
+        color:#61594E;
+        font-size:.68rem;
+        font-weight:650;
+    }
+    .gp-chip.lock {background:var(--gold-soft); color:var(--gold-ink);}
+    .gp-chip.done {background:var(--sage); color:var(--sage-ink);}
+    .gp-chip.cancel {background:var(--rose-soft); color:var(--rose-ink);}
+    .gp-chip.move {background:var(--blue-soft); color:var(--blue-ink);}
+    .gp-drivehome {
+        margin:.32rem 0 .1rem .35rem;
+        color:var(--muted);
+        font-size:.7rem;
+    }
+
+    /* Status banners */
     div[data-testid="stAlert"] {
-        border-radius: 12px;
-        padding: .65rem .8rem;
-        font-size: .88rem;
+        border-radius: 13px;
+        border: 1px solid rgba(24,36,61,.08);
+        padding: .6rem .72rem;
+        font-size: .82rem;
+        box-shadow:none;
     }
 
-    /* Inputs */
+    /* Controls */
+    .stButton > button,
+    .stLinkButton > a {
+        border-radius: 11px !important;
+        min-height: 42px;
+        font-weight: 680;
+        border-color: #D9DCE3;
+    }
+    .stButton > button[kind="primary"] {
+        background: var(--navy);
+        border-color: var(--navy);
+    }
     div[data-baseweb="select"] > div,
     div[data-baseweb="input"] > div,
     div[data-testid="stDateInput"] > div > div,
     div[data-testid="stTimeInput"] > div > div {
-        border-radius: 10px !important;
+        border-radius: 11px !important;
+        background: var(--paper);
     }
 
-    /* Buttons */
-    .stButton > button,
-    .stLinkButton > a {
-        border-radius: 10px !important;
-        min-height: 42px;
-        font-weight: 650;
-    }
-
-    .stButton > button[kind="primary"] {
-        background: var(--gp-accent);
-        border-color: var(--gp-accent);
-    }
-
-    /* Expanders as appointment cards */
+    /* Today appointment expanders */
     div[data-testid="stExpander"] {
-        border: 1px solid var(--gp-border);
-        border-radius: 13px;
+        background: var(--paper);
+        border: 1px solid var(--line);
+        border-radius: 14px;
         overflow: hidden;
-        background: #FFFFFF;
-        margin-bottom: .45rem;
+        margin-bottom: .42rem;
+        box-shadow: 0 3px 12px rgba(24,36,61,.035);
+    }
+    div[data-testid="stExpander"] details summary {
+        padding: .66rem .76rem;
+        font-weight: 700;
     }
 
-    div[data-testid="stExpander"] details summary {
-        padding: .72rem .85rem;
-        font-weight: 650;
+    /* Dataframes */
+    div[data-testid="stDataFrame"] {
+        border-radius: 13px;
+        overflow:hidden;
+        border:1px solid var(--line);
     }
 
     /* Captions */
     .stCaption, [data-testid="stCaptionContainer"] {
-        color: var(--gp-muted) !important;
-        font-size: .79rem !important;
+        color: var(--muted) !important;
+        font-size: .75rem !important;
     }
 
     hr {
-        border-color: var(--gp-border);
-        margin: .75rem 0;
+        border-color: var(--line);
+        margin: .68rem 0;
     }
 
-    /* Sidebar */
     section[data-testid="stSidebar"] {
-        border-right: 1px solid var(--gp-border);
+        background:#F1EEE9;
+        border-right:1px solid #E1DDD6;
     }
 
-    /* Mobile tightening */
     @media (max-width: 700px) {
         .block-container {
-            padding: .9rem .75rem 3rem .75rem;
+            padding: .72rem .62rem 4rem .62rem;
         }
-
-        .gp-app-title {
-            font-size: 1.42rem;
+        .gp-hero {
+            border-radius: 18px;
+            padding: .92rem .95rem .82rem .95rem;
+            margin-bottom: .62rem;
         }
-
-        .gp-app-subtitle {
-            font-size: .8rem;
-            margin-bottom: .65rem;
-        }
-
-        h2 {
-            font-size: 1.25rem !important;
-        }
-
-        h3 {
-            font-size: 1rem !important;
-        }
-
-        div[data-testid="stMetric"] {
-            padding: .62rem .55rem;
-        }
-
-        div[data-testid="stMetricValue"] {
-            font-size: 1.05rem;
-        }
-
+        .gp-title {font-size:1.42rem;}
+        .gp-subtitle {font-size:.76rem;}
+        .gp-eyebrow {font-size:.61rem;}
         button[data-baseweb="tab"] {
-            font-size: .8rem;
-            padding: .42rem .58rem !important;
+            font-size:.76rem;
+            padding:.4rem .64rem !important;
+            min-height:36px;
         }
-
-        div[data-testid="stAlert"] {
-            padding: .55rem .65rem;
-        }
+        h2 {font-size:1.2rem !important;}
+        h3 {font-size:.98rem !important;}
+        div[data-testid="stMetric"] {padding:.58rem .5rem;}
+        div[data-testid="stMetricValue"] {font-size:1.03rem;}
+        div[data-testid="stMetricLabel"] {font-size:.62rem;}
+        .gp-appt {padding:.62rem .66rem;}
+        .gp-appt-name {font-size:.86rem;}
+        .gp-appt-time {font-size:.68rem;}
     }
     </style>
 
-    <div class="gp-app-title">🐾 Grooming Planner</div>
-    <div class="gp-app-subtitle">Routes, clients, recurring services & daily schedule</div>
+    <div class="gp-hero">
+      <div class="gp-eyebrow">Mobile grooming</div>
+      <div class="gp-title">Grooming Planner</div>
+      <div class="gp-subtitle">Today’s route, recurring clients, schedules & drive time</div>
+    </div>
     """,
     unsafe_allow_html=True,
 )
@@ -2162,8 +2274,15 @@ def render_weekly_cards(valid_plan, daily_capacity, travel_buffer):
         day_appts = len(day_group)
 
         st.markdown(
-            f"### {day_name} · {pd.Timestamp(day_date):%b %d}"
-            f"  \n{day_appts} appts · {day_minutes} groom min · ${day_revenue:,.0f}"
+            f"""<div style="margin:.9rem 0 .18rem 0">
+            <div style="font-size:1.02rem;font-weight:780;color:#18243D;">
+              {html.escape(str(day_name))} · {pd.Timestamp(day_date):%b %d}
+            </div>
+            <div style="font-size:.72rem;color:#6F7787;margin-top:.08rem;">
+              {day_appts} stops · {day_minutes} groom min · ${day_revenue:,.0f}
+            </div>
+            </div>""",
+            unsafe_allow_html=True,
         )
 
         for groomer, groomer_group in day_group.groupby("Groomer", sort=False):
@@ -2177,7 +2296,11 @@ def render_weekly_cards(valid_plan, daily_capacity, travel_buffer):
                 area = str(groomer_group["Area Cluster"].dropna().iloc[0])
 
             st.markdown(
-                f"**{groomer}" + (f" · {area}" if area else "") + "**"
+                f"""<div class="gp-sectionbar">
+                <span class="gp-sectionbar-name">{html.escape(str(groomer))}</span>
+                <span class="gp-sectionbar-note">{html.escape(area) if area else "Route"}</span>
+                </div>""",
+                unsafe_allow_html=True,
             )
 
             for _, row in groomer_group.iterrows():
@@ -2263,9 +2386,45 @@ def render_weekly_cards(valid_plan, daily_capacity, travel_buffer):
                 ):
                     drive_text = f" · 🚗 ~{float(drive_minutes):.0f} min fallback"
 
+                status_class = ""
+                status_text = status
+                if completion_status == "Completed":
+                    status_class = "done"
+                elif appointment_status == "Cancelled":
+                    status_class = "cancel"
+                elif appointment_status in {"Rescheduled", "Moved to another week"}:
+                    status_class = "move"
+
+                chips = [
+                    f'<span class="gp-chip">{minutes} min</span>',
+                    f'<span class="gp-chip">${price:,.0f}</span>',
+                ]
+                if drive_text:
+                    clean_drive = drive_text.replace(" · ", "", 1)
+                    chips.append(
+                        f'<span class="gp-chip">{html.escape(clean_drive)}</span>'
+                    )
+                if locked_time:
+                    chips.append(
+                        f'<span class="gp-chip lock">🔒 {html.escape(locked_time)}</span>'
+                    )
+                if status_text:
+                    chips.append(
+                        f'<span class="gp-chip {status_class}">{html.escape(status_text)}</span>'
+                    )
+
                 st.markdown(
-                    f"- **{start_time}–{end_time}{lock_badge}** · **{owner}{dog_text}** "
-                    f"· {minutes} min · ${price:,.0f}{drive_text} · {status}"
+                    f"""<div class="gp-appt">
+                    <div class="gp-appt-top">
+                      <div>
+                        <div class="gp-appt-name">{html.escape(owner)}</div>
+                        <div class="gp-appt-dogs">{html.escape(dogs) if dogs else "Client stop"}</div>
+                      </div>
+                      <div class="gp-appt-time">{html.escape(start_time)}–{html.escape(end_time)}</div>
+                    </div>
+                    <div class="gp-appt-meta">{''.join(chips)}</div>
+                    </div>""",
+                    unsafe_allow_html=True,
                 )
 
                 return_home_minutes = pd.to_numeric(
@@ -2280,14 +2439,17 @@ def render_weekly_cards(valid_plan, daily_capacity, travel_buffer):
                     pd.notna(return_home_minutes)
                     and float(return_home_minutes) > 0
                 ):
-                    st.markdown(
-                        f"  ↳ **Drive home:** "
+                    home_text = (
                         f"{float(return_home_minutes):.0f} min"
                         + (
                             f" / {float(return_home_miles):.1f} mi"
                             if pd.notna(return_home_miles)
                             else ""
                         )
+                    )
+                    st.markdown(
+                        f'<div class="gp-drivehome">↳ Drive home: {html.escape(home_text)}</div>',
+                        unsafe_allow_html=True,
                     )
 
             used_minutes = int(groomer_group["Minutes"].fillna(0).sum())
@@ -4451,7 +4613,7 @@ if "appointments" not in st.session_state:
 
 # ---------- Sidebar: private data ----------
 
-st.sidebar.caption("Grooming Planner · v25")
+st.sidebar.caption("Grooming Planner · v26")
 st.sidebar.header("Private data")
 
 if supabase_configured():
@@ -4669,7 +4831,7 @@ today_tab, planner_tab, monthly_tab, weekly_tab, clients_tab, due_tab, export_ta
 # ---------- Today ----------
 
 with today_tab:
-    st.markdown("## Today")
+    st.markdown("## Today’s route")
     st.caption("Your day at a glance — route, timing, status and quick actions.")
 
     today_view_date = st.date_input(
@@ -4754,7 +4916,13 @@ with today_tab:
                 "Groomer",
                 sort=False,
             ):
-                st.markdown(f"### {groomer}")
+                st.markdown(
+                    f"""<div class="gp-sectionbar">
+                    <span class="gp-sectionbar-name">{html.escape(str(groomer))}</span>
+                    <span class="gp-sectionbar-note">{len(groomer_rows)} stop{"s" if len(groomer_rows) != 1 else ""}</span>
+                    </div>""",
+                    unsafe_allow_html=True,
+                )
 
                 for row_index, row in groomer_rows.iterrows():
                     owner = str(row.get("Owner", "") or "").strip()
@@ -5340,9 +5508,8 @@ def schedule_data_fingerprint(df):
 
 with monthly_tab:
     st.markdown("## Monthly planner")
-    st.info(
-        "Confirmed weeks are your real schedule. Future recurring work is shown "
-        "separately as projected / unscheduled until you build and confirm it."
+    st.caption(
+        "Confirmed weeks are your real schedule. Future recurring work stays projected until scheduled."
     )
 
     saved_month = pd.Timestamp(
@@ -5727,7 +5894,7 @@ with weekly_tab:
             "No private clients are saved yet. Add dogs in Client Manager, "
             "then the weekly route builder will start using them."
         )
-    st.markdown("### Build the week automatically")
+    st.markdown("## Build your week")
     st.caption(
         "Build a Monday–Friday draft using due status, workdays, service length, area and revenue."
     )
@@ -6120,10 +6287,9 @@ with weekly_tab:
             travel_buffer=travel_buffer,
         )
 
-        st.markdown("### Exact appointment time")
+        st.markdown("### Time lock")
         st.caption(
-            "Lock a customer to a promised arrival time. Google Maps will route "
-            "the other appointments around it. Choose Flexible to remove the lock."
+            "Pin a promised arrival time. The rest of the route will optimize around it."
         )
 
         exact_time_candidates = active_valid.copy()
@@ -7900,6 +8066,6 @@ with export_tab:
         st.code('GOOGLE_MAPS_API_KEY = "your-key-here"')
 
 st.caption(
-    "Mobile Grooming Planner v25 · private Supabase data · recurring service schedules · "
+    "Mobile Grooming Planner v26 · private Supabase data · recurring service schedules · "
     "weekly/monthly planning · completion tracking · optional Google Maps routing."
 )
