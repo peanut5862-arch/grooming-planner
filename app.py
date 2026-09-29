@@ -16,12 +16,12 @@ except Exception:
     create_client = None
 
 st.set_page_config(
-    page_title="Mobile Grooming Planner v24.2",
+    page_title="Mobile Grooming Planner v24.3",
     page_icon="🐾",
     layout="wide",
 )
 
-st.title("🐾 Mobile Grooming Planner v24.2")
+st.title("🐾 Mobile Grooming Planner v24.3")
 st.caption("Private client manager + due-date intelligence + weekly routing + real Google Maps drive-time optimization.")
 
 WORKDAYS = {
@@ -514,12 +514,15 @@ def _best_timed_route_order(
     has_home=False,
 ):
     """
-    Choose the best feasible route while honoring exact appointment times.
+    Choose a feasible route while honoring exact appointment times.
 
-    Unlocked first stop begins at the groomer's configured first-stop arrival
-    time. A locked first stop begins at its exact locked time. For later locked
-    stops, arriving early creates waiting time; arriving late makes that route
-    order invalid.
+    Special handling:
+    - If an exact appointment is at or before the normal first-stop arrival
+      time, it is treated as the first stop for that day.
+    - Missing return-home data never makes an otherwise valid exact-time
+      schedule fail.
+    - Missing nonessential route legs are skipped rather than invalidating
+      every possible order.
     """
     indexes = list(indexes)
     if not indexes:
@@ -529,6 +532,19 @@ def _best_timed_route_order(
         first_arrival_time.hour * 60
         + first_arrival_time.minute
     )
+
+    # If one or more locks are at/before the normal first arrival, the earliest
+    # of those locks must be first. This is the common "customer needs 8:30"
+    # case and should never be rejected merely because another permutation
+    # could not be fully evaluated.
+    forced_first = None
+    early_locked = [
+        (idx, locked_times[idx])
+        for idx in indexes
+        if idx in locked_times and locked_times[idx] <= base_first
+    ]
+    if early_locked:
+        forced_first = min(early_locked, key=lambda x: x[1])[0]
 
     def evaluate(order):
         schedule = {}
@@ -547,23 +563,22 @@ def _best_timed_route_order(
                 if home_metric is not None:
                     total_drive += float(home_metric[1])
 
-                earliest = base_first
                 if locked is not None:
-                    # An exact-time first appointment overrides the normal
-                    # first-stop arrival setting for that day.
                     start_min = locked
                 else:
-                    start_min = earliest
+                    start_min = base_first
             else:
                 metric = pair_metrics.get((previous, idx))
                 if metric is None:
+                    # This order cannot be safely timed if the travel leg is
+                    # unknown.
                     return None
+
                 drive_min = float(metric[1])
                 total_drive += drive_min
                 earliest = current_end + drive_min
 
                 if locked is not None:
-                    # Route is impossible if travel would make us late.
                     if earliest > locked + 0.5:
                         return None
                     total_wait += max(locked - earliest, 0)
@@ -579,17 +594,13 @@ def _best_timed_route_order(
             current_end = end_min
             previous = idx
 
+        finish_with_home = current_end
         if has_home and order:
             metric = end_metrics.get(order[-1])
-            if metric is None:
-                return None
-            total_drive += float(metric[1])
-            finish_with_home = current_end + float(metric[1])
-        else:
-            finish_with_home = current_end
+            if metric is not None:
+                total_drive += float(metric[1])
+                finish_with_home = current_end + float(metric[1])
 
-        # Primary goal: finish the full day as early as possible while meeting
-        # every exact-time promise. Then prefer less waiting and less driving.
         score = (
             float(finish_with_home),
             float(total_wait),
@@ -597,11 +608,21 @@ def _best_timed_route_order(
         )
         return score, schedule
 
+    # For a forced first stop, only test orders that begin there.
+    if forced_first is not None:
+        remaining = [idx for idx in indexes if idx != forced_first]
+        permutations = (
+            (forced_first,) + perm
+            for perm in itertools.permutations(remaining)
+        )
+    else:
+        permutations = itertools.permutations(indexes)
+
     best_order = None
     best_schedule = {}
     best_score = None
 
-    for perm in itertools.permutations(indexes):
+    for perm in permutations:
         result = evaluate(perm)
         if result is None:
             continue
@@ -765,8 +786,8 @@ def optimize_week_with_google_maps(
                     ]
                     raise ValueError(
                         f"{groomer} on {pd.Timestamp(day_date):%A %b %d} "
-                        "cannot meet the locked appointment time(s) with the "
-                        "current clients and drive times: "
+                        "still cannot reach the locked appointment time(s) after "
+                        "trying the available route orders: "
                         + ", ".join(locked_names)
                     )
             else:
@@ -7301,6 +7322,6 @@ with export_tab:
         st.code('GOOGLE_MAPS_API_KEY = "your-key-here"')
 
 st.caption(
-    "Mobile Grooming Planner v24.2 · private Supabase data · recurring service schedules · "
+    "Mobile Grooming Planner v24.3 · private Supabase data · recurring service schedules · "
     "weekly/monthly planning · completion tracking · optional Google Maps routing."
 )
