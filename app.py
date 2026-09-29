@@ -17,13 +17,223 @@ except Exception:
     create_client = None
 
 st.set_page_config(
-    page_title="Mobile Grooming Planner v24.7",
+    page_title="Mobile Grooming Planner v25",
     page_icon="🐾",
     layout="wide",
 )
 
-st.title("🐾 Mobile Grooming Planner v24.7")
-st.caption("Private client manager + due-date intelligence + weekly routing + real Google Maps drive-time optimization.")
+# ---------- App styling ----------
+st.markdown(
+    """
+    <style>
+    :root {
+        --gp-ink: #172033;
+        --gp-muted: #667085;
+        --gp-border: #E7EAF0;
+        --gp-soft: #F7F8FA;
+        --gp-accent: #243B64;
+        --gp-accent-soft: #EEF3FA;
+    }
+
+    /* Overall page */
+    .stApp {
+        background: #FFFFFF;
+        color: var(--gp-ink);
+    }
+
+    .block-container {
+        padding-top: 1.4rem;
+        padding-bottom: 4rem;
+        max-width: 1180px;
+    }
+
+    /* Hide Streamlit chrome clutter */
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+
+    /* Main app header */
+    .gp-app-title {
+        font-size: 1.7rem;
+        line-height: 1.15;
+        font-weight: 750;
+        letter-spacing: -0.025em;
+        margin: 0 0 .15rem 0;
+        color: var(--gp-ink);
+    }
+
+    .gp-app-subtitle {
+        font-size: .88rem;
+        color: var(--gp-muted);
+        margin-bottom: 1rem;
+    }
+
+    /* Headings */
+    h1, h2, h3, h4 {
+        color: var(--gp-ink);
+        letter-spacing: -0.018em;
+    }
+
+    h2 {
+        font-size: 1.45rem !important;
+        margin-top: .7rem !important;
+        margin-bottom: .45rem !important;
+    }
+
+    h3 {
+        font-size: 1.08rem !important;
+        margin-top: .85rem !important;
+        margin-bottom: .35rem !important;
+    }
+
+    /* Tabs become compact pill navigation */
+    button[data-baseweb="tab"] {
+        border-radius: 999px;
+        padding: .48rem .72rem !important;
+        min-height: 40px;
+        white-space: nowrap;
+        font-size: .86rem;
+    }
+
+    div[data-baseweb="tab-list"] {
+        gap: .3rem;
+        overflow-x: auto;
+        scrollbar-width: none;
+        padding-bottom: .2rem;
+    }
+
+    div[data-baseweb="tab-list"]::-webkit-scrollbar {
+        display: none;
+    }
+
+    button[data-baseweb="tab"][aria-selected="true"] {
+        background: var(--gp-accent-soft);
+        color: var(--gp-accent);
+        font-weight: 700;
+    }
+
+    /* Metric cards */
+    div[data-testid="stMetric"] {
+        background: var(--gp-soft);
+        border: 1px solid var(--gp-border);
+        border-radius: 14px;
+        padding: .8rem .85rem;
+    }
+
+    div[data-testid="stMetricLabel"] {
+        font-size: .76rem;
+        color: var(--gp-muted);
+    }
+
+    div[data-testid="stMetricValue"] {
+        font-size: 1.28rem;
+        color: var(--gp-ink);
+    }
+
+    /* Alerts / status boxes */
+    div[data-testid="stAlert"] {
+        border-radius: 12px;
+        padding: .65rem .8rem;
+        font-size: .88rem;
+    }
+
+    /* Inputs */
+    div[data-baseweb="select"] > div,
+    div[data-baseweb="input"] > div,
+    div[data-testid="stDateInput"] > div > div,
+    div[data-testid="stTimeInput"] > div > div {
+        border-radius: 10px !important;
+    }
+
+    /* Buttons */
+    .stButton > button,
+    .stLinkButton > a {
+        border-radius: 10px !important;
+        min-height: 42px;
+        font-weight: 650;
+    }
+
+    .stButton > button[kind="primary"] {
+        background: var(--gp-accent);
+        border-color: var(--gp-accent);
+    }
+
+    /* Expanders as appointment cards */
+    div[data-testid="stExpander"] {
+        border: 1px solid var(--gp-border);
+        border-radius: 13px;
+        overflow: hidden;
+        background: #FFFFFF;
+        margin-bottom: .45rem;
+    }
+
+    div[data-testid="stExpander"] details summary {
+        padding: .72rem .85rem;
+        font-weight: 650;
+    }
+
+    /* Captions */
+    .stCaption, [data-testid="stCaptionContainer"] {
+        color: var(--gp-muted) !important;
+        font-size: .79rem !important;
+    }
+
+    hr {
+        border-color: var(--gp-border);
+        margin: .75rem 0;
+    }
+
+    /* Sidebar */
+    section[data-testid="stSidebar"] {
+        border-right: 1px solid var(--gp-border);
+    }
+
+    /* Mobile tightening */
+    @media (max-width: 700px) {
+        .block-container {
+            padding: .9rem .75rem 3rem .75rem;
+        }
+
+        .gp-app-title {
+            font-size: 1.42rem;
+        }
+
+        .gp-app-subtitle {
+            font-size: .8rem;
+            margin-bottom: .65rem;
+        }
+
+        h2 {
+            font-size: 1.25rem !important;
+        }
+
+        h3 {
+            font-size: 1rem !important;
+        }
+
+        div[data-testid="stMetric"] {
+            padding: .62rem .55rem;
+        }
+
+        div[data-testid="stMetricValue"] {
+            font-size: 1.05rem;
+        }
+
+        button[data-baseweb="tab"] {
+            font-size: .8rem;
+            padding: .42rem .58rem !important;
+        }
+
+        div[data-testid="stAlert"] {
+            padding: .55rem .65rem;
+        }
+    }
+    </style>
+
+    <div class="gp-app-title">🐾 Grooming Planner</div>
+    <div class="gp-app-subtitle">Routes, clients, recurring services & daily schedule</div>
+    """,
+    unsafe_allow_html=True,
+)
 
 WORKDAYS = {
     "Jen": ["Tuesday", "Wednesday", "Thursday"],
@@ -4241,6 +4451,7 @@ if "appointments" not in st.session_state:
 
 # ---------- Sidebar: private data ----------
 
+st.sidebar.caption("Grooming Planner · v25")
 st.sidebar.header("Private data")
 
 if supabase_configured():
@@ -4446,11 +4657,11 @@ today_tab, planner_tab, monthly_tab, weekly_tab, clients_tab, due_tab, export_ta
     [
         "☀️ Today",
         "📅 Planner",
-        "🗓️ Monthly Planner",
-        "📆 Weekly Route Builder",
-        "👥 Client Manager",
-        "⏰ Due List",
-        "🔐 Private Data",
+        "🗓️ Month",
+        "📆 Week",
+        "👥 Clients",
+        "⏰ Due",
+        "🔐 Data",
     ]
 )
 
@@ -4459,10 +4670,7 @@ today_tab, planner_tab, monthly_tab, weekly_tab, clients_tab, due_tab, export_ta
 
 with today_tab:
     st.markdown("## Today")
-    st.caption(
-        "Your mobile workday view. See the route, then mark appointments completed, "
-        "cancel them, or move them without opening the full weekly builder."
-    )
+    st.caption("Your day at a glance — route, timing, status and quick actions.")
 
     today_view_date = st.date_input(
         "Day",
@@ -4525,12 +4733,9 @@ with today_tab:
         )
 
         if today_week_status == "confirmed":
-            st.success("This week is CONFIRMED.")
+            st.success("✓ Confirmed week")
         else:
-            st.warning(
-                "This week is still a DRAFT. Daily actions will save, but review and "
-                "confirm the week when the schedule is final."
-            )
+            st.warning("Draft week — changes save automatically. Confirm when final.")
 
         if today_rows.empty:
             st.info("No appointments are scheduled for this day.")
@@ -5513,9 +5718,8 @@ with monthly_tab:
 
 
 with weekly_tab:
-    st.info(
-        "Schedule-strict mode: this builder only uses overdue clients or clients "
-        "due during the selected week. It will not pull not-due clients forward."
+    st.caption(
+        "Strict scheduling: automatic drafts use only overdue clients or clients due this week."
     )
 
     if st.session_state.clients.empty:
@@ -5525,13 +5729,10 @@ with weekly_tab:
         )
     st.markdown("### Build the week automatically")
     st.caption(
-        "Creates a Monday–Friday draft using due/overdue status, groomer workdays, "
-        "appointment length, area clustering, and revenue."
+        "Build a Monday–Friday draft using due status, workdays, service length, area and revenue."
     )
-    st.success(
-        "Saved-week mode: once you move or add clients, the exact weekly draft is "
-        "stored in the private database. It will not rebuild unless you tap "
-        "Generate / rebuild week or Reset this week."
+    st.caption(
+        "Saved automatically. Your manual moves stay put unless you rebuild or reset the week."
     )
     # Cross-week rescheduling cannot directly change a widget key after that
     # widget has already been created in the same Streamlit run. Store the
@@ -5599,7 +5800,7 @@ with weekly_tab:
         capacity_options = [300, 360, 420, 480, 540]
         saved_capacity = int(saved_settings.get("daily_capacity", 420))
         daily_capacity = st.selectbox(
-            "Approximate grooming minutes available per groomer/day",
+            "Daily grooming capacity",
             capacity_options,
             index=(
                 capacity_options.index(saved_capacity)
@@ -5614,7 +5815,7 @@ with weekly_tab:
         appt_options = [3, 4, 5, 6]
         saved_appts = int(saved_settings.get("max_appointments", 4))
         max_appointments = st.selectbox(
-            "Maximum appointments per groomer/day",
+            "Max appointments / day",
             appt_options,
             index=(
                 appt_options.index(saved_appts)
@@ -5624,7 +5825,7 @@ with weekly_tab:
             key=f"max_appointments_{week_key}",
         )
 
-    st.markdown("#### Time assumptions")
+    st.markdown("#### Day timing")
 
     t1, t2 = st.columns(2)
 
@@ -5648,7 +5849,7 @@ with weekly_tab:
         travel_options = [10, 15, 20, 25, 30, 45]
         saved_travel = int(saved_settings.get("travel_buffer", 20))
         travel_buffer = st.selectbox(
-            "Travel / setup buffer",
+            "Fallback travel buffer",
             travel_options,
             index=(
                 travel_options.index(saved_travel)
@@ -5663,7 +5864,7 @@ with weekly_tab:
         service_options = [0, 5, 10, 15]
         saved_service = int(saved_settings.get("service_buffer", 0))
         service_buffer = st.selectbox(
-            "Extra service buffer per household",
+            "Extra service buffer",
             service_options,
             index=(
                 service_options.index(saved_service)
@@ -7699,6 +7900,6 @@ with export_tab:
         st.code('GOOGLE_MAPS_API_KEY = "your-key-here"')
 
 st.caption(
-    "Mobile Grooming Planner v24.7 · private Supabase data · recurring service schedules · "
+    "Mobile Grooming Planner v25 · private Supabase data · recurring service schedules · "
     "weekly/monthly planning · completion tracking · optional Google Maps routing."
 )
