@@ -15,12 +15,12 @@ except Exception:
     create_client = None
 
 st.set_page_config(
-    page_title="Mobile Grooming Planner v12.5",
+    page_title="Mobile Grooming Planner v12.6",
     page_icon="🐾",
     layout="wide",
 )
 
-st.title("🐾 Mobile Grooming Planner v12.5")
+st.title("🐾 Mobile Grooming Planner v12.6")
 st.caption("Private client manager + due-date intelligence + cancellation filling + optional real drive-time scoring.")
 
 WORKDAYS = {
@@ -522,7 +522,32 @@ def score_candidates(
 
 def household_due_table(dog_df, target_date):
     """Aggregate dog-level rows into one schedulable household appointment."""
+    output_columns = [
+        "Household ID",
+        "Owner",
+        "Dogs",
+        "Area",
+        "Groomer",
+        "Days Until Due",
+        "Status",
+        "Price",
+        "Minutes",
+        "Last Contacted",
+        "Latitude",
+        "Longitude",
+        "Address",
+        "City",
+        "State",
+        "ZIP",
+    ]
+
     due = calculate_due_fields(dog_df, target_date).copy()
+
+    # A brand-new private database is valid and may have zero clients.
+    # Return the expected schema so downstream tabs can render cleanly
+    # instead of raising KeyError on columns such as "Groomer".
+    if due.empty:
+        return pd.DataFrame(columns=output_columns)
 
     rows = []
     for household_id, group in due.groupby("Household ID", dropna=False):
@@ -582,7 +607,7 @@ def household_due_table(dog_df, target_date):
             "ZIP": zip_code,
         })
 
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows, columns=output_columns)
 
 def household_member_detail(dog_df, household_id):
     group = dog_df[dog_df["Household ID"] == household_id].copy()
@@ -1714,6 +1739,11 @@ def household_member_detail(dog_df, household_id):
 # ---------- Weekly route builder ----------
 
 with weekly_tab:
+    if st.session_state.clients.empty:
+        st.info(
+            "No private clients are saved yet. Add dogs in Client Manager, "
+            "then the weekly route builder will start using them."
+        )
     st.markdown("### Build the week automatically")
     st.caption(
         "Creates a Monday–Friday draft using due/overdue status, groomer workdays, "
@@ -1896,6 +1926,12 @@ with weekly_tab:
 # ---------- Client manager ----------
 
 with clients_tab:
+    if supabase_configured() and st.session_state.clients.empty:
+        st.info(
+            "Your private database is connected and currently empty. "
+            "Add your first real dog below."
+        )
+
     st.markdown("### Add a dog")
     st.caption("One row = one dog. Household ID is automatic, and you can paste the full address in one line.")
 
