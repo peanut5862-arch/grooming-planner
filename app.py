@@ -15,12 +15,12 @@ except Exception:
     create_client = None
 
 st.set_page_config(
-    page_title="Mobile Grooming Planner v12.6",
+    page_title="Mobile Grooming Planner v12.7",
     page_icon="🐾",
     layout="wide",
 )
 
-st.title("🐾 Mobile Grooming Planner v12.6")
+st.title("🐾 Mobile Grooming Planner v12.7")
 st.caption("Private client manager + due-date intelligence + cancellation filling + optional real drive-time scoring.")
 
 WORKDAYS = {
@@ -801,8 +801,33 @@ def build_week_plan(
     daily_capacity_minutes=420,
     max_appointments_per_day=4,
 ):
+    output_columns = [
+        "Date",
+        "Day",
+        "Groomer",
+        "Area Cluster",
+        "Owner",
+        "Dogs",
+        "Status",
+        "Minutes",
+        "Price",
+        "Score",
+    ]
+
+    # A newly connected private database can legitimately contain zero clients.
+    # Return a correctly shaped empty plan instead of trying to filter missing data.
+    if clients_df is None or clients_df.empty:
+        return pd.DataFrame(columns=output_columns)
+
     due = household_due_table(clients_df, week_start)
+
+    if due.empty or "Days Until Due" not in due.columns:
+        return pd.DataFrame(columns=output_columns)
+
     due = due[due["Days Until Due"].notna()].copy()
+
+    if due.empty:
+        return pd.DataFrame(columns=output_columns)
 
     # Automatic weekly planning considers overdue clients and clients due
     # within the next three weeks.
@@ -902,7 +927,7 @@ def build_week_plan(
                         "Score": int(row["Weekly Score"]),
                     })
 
-    return pd.DataFrame(results)
+    return pd.DataFrame(results, columns=output_columns)
 
 
 
