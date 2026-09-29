@@ -17,12 +17,12 @@ except Exception:
     create_client = None
 
 st.set_page_config(
-    page_title="Mobile Grooming Planner v24.6",
+    page_title="Mobile Grooming Planner v24.7",
     page_icon="🐾",
     layout="wide",
 )
 
-st.title("🐾 Mobile Grooming Planner v24.6")
+st.title("🐾 Mobile Grooming Planner v24.7")
 st.caption("Private client manager + due-date intelligence + weekly routing + real Google Maps drive-time optimization.")
 
 WORKDAYS = {
@@ -2058,6 +2058,28 @@ def render_weekly_cards(valid_plan, daily_capacity, travel_buffer):
                     f"· {minutes} min · ${price:,.0f}{drive_text} · {status}"
                 )
 
+                return_home_minutes = pd.to_numeric(
+                    row.get("Drive Home After Min"),
+                    errors="coerce",
+                )
+                return_home_miles = pd.to_numeric(
+                    row.get("Drive Home After Miles"),
+                    errors="coerce",
+                )
+                if (
+                    pd.notna(return_home_minutes)
+                    and float(return_home_minutes) > 0
+                ):
+                    st.markdown(
+                        f"  ↳ **Drive home:** "
+                        f"{float(return_home_minutes):.0f} min"
+                        + (
+                            f" / {float(return_home_miles):.1f} mi"
+                            if pd.notna(return_home_miles)
+                            else ""
+                        )
+                    )
+
             used_minutes = int(groomer_group["Minutes"].fillna(0).sum())
             appt_count = len(groomer_group)
 
@@ -2146,12 +2168,72 @@ def render_weekly_cards(valid_plan, daily_capacity, travel_buffer):
                     else ""
                 )
 
+                first_leg_min = 0.0
+                first_leg_miles = 0.0
+                if not groomer_group.empty:
+                    ordered_group = groomer_group.copy()
+                    if "Route Order" in ordered_group.columns:
+                        ordered_group["_Route Sort"] = pd.to_numeric(
+                            ordered_group["Route Order"],
+                            errors="coerce",
+                        ).fillna(999)
+                        ordered_group = ordered_group.sort_values(
+                            ["_Route Sort", "_Start Sort"],
+                            kind="stable",
+                        )
+                    first_row = ordered_group.iloc[0]
+                    first_leg_min = float(
+                        pd.to_numeric(
+                            first_row.get("Drive From Previous Min"),
+                            errors="coerce",
+                        )
+                        if pd.notna(
+                            pd.to_numeric(
+                                first_row.get("Drive From Previous Min"),
+                                errors="coerce",
+                            )
+                        )
+                        else 0
+                    )
+                    first_leg_miles = float(
+                        pd.to_numeric(
+                            first_row.get("Drive From Previous Miles"),
+                            errors="coerce",
+                        )
+                        if pd.notna(
+                            pd.to_numeric(
+                                first_row.get("Drive From Previous Miles"),
+                                errors="coerce",
+                            )
+                        )
+                        else 0
+                    )
+
+                between_min = max(
+                    outbound_and_between_min - first_leg_min,
+                    0.0,
+                )
+                between_miles = max(
+                    outbound_and_between_miles - first_leg_miles,
+                    0.0,
+                )
+
                 st.caption(
-                    f"{groomer}: {travel_total} drive min · "
-                    f"{drive_miles:.1f} mi · {route_scope}"
+                    f"{groomer}: {travel_total} total drive min · "
+                    f"{drive_miles:.1f} total mi · {route_scope}"
                     f"{leave_home_text} · "
                     f"{open_minutes} open min remaining"
                 )
+
+                if home_mode:
+                    st.caption(
+                        f"Home → first: {first_leg_min:.0f} min / "
+                        f"{first_leg_miles:.1f} mi · "
+                        f"Between stops: {between_min:.0f} min / "
+                        f"{between_miles:.1f} mi · "
+                        f"Last → home: {return_home_min:.0f} min / "
+                        f"{return_home_miles:.1f} mi"
+                    )
             else:
                 travel_total = max(appt_count - 1, 0) * int(travel_buffer)
                 open_minutes = max(
@@ -4560,6 +4642,28 @@ with today_tab:
                             + (f" · {area}" if area else "")
                             + drive_detail
                         )
+
+                        return_home_minutes = pd.to_numeric(
+                            row.get("Drive Home After Min"),
+                            errors="coerce",
+                        )
+                        return_home_miles = pd.to_numeric(
+                            row.get("Drive Home After Miles"),
+                            errors="coerce",
+                        )
+                        if (
+                            pd.notna(return_home_minutes)
+                            and float(return_home_minutes) > 0
+                        ):
+                            st.caption(
+                                "Drive home after this stop: "
+                                f"{float(return_home_minutes):.0f} min"
+                                + (
+                                    f" / {float(return_home_miles):.1f} mi"
+                                    if pd.notna(return_home_miles)
+                                    else ""
+                                )
+                            )
 
                         if completion_status == "Completed":
                             st.success("This appointment is already completed.")
@@ -7595,6 +7699,6 @@ with export_tab:
         st.code('GOOGLE_MAPS_API_KEY = "your-key-here"')
 
 st.caption(
-    "Mobile Grooming Planner v24.6 · private Supabase data · recurring service schedules · "
+    "Mobile Grooming Planner v24.7 · private Supabase data · recurring service schedules · "
     "weekly/monthly planning · completion tracking · optional Google Maps routing."
 )
