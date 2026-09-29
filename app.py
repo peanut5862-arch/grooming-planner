@@ -18,7 +18,7 @@ except Exception:
     create_client = None
 
 st.set_page_config(
-    page_title="Mobile Grooming Planner v29",
+    page_title="Mobile Grooming Planner v30",
     page_icon="🐾",
     layout="wide",
 )
@@ -5099,7 +5099,7 @@ if "appointments" not in st.session_state:
 
 # ---------- Sidebar: private data ----------
 
-st.sidebar.caption("Grooming Planner · v29")
+st.sidebar.caption("Grooming Planner · v30")
 st.sidebar.header("Private data")
 
 if supabase_configured():
@@ -6388,7 +6388,7 @@ with monthly_tab:
         projected_unscheduled.get("Minutes", pd.Series(dtype=float)).sum()
     ) if not projected_unscheduled.empty else 0
 
-    st.markdown(f"### {month_start:%B %Y} overview")
+    st.markdown(f"### {month_start:%B %Y} business overview")
 
     m1, m2 = st.columns(2)
     m1.metric("Confirmed appointments", confirmed_appts)
@@ -6409,16 +6409,82 @@ with monthly_tab:
 
     st.markdown("### Month at a glance")
     st.caption(
-        "A workweek planner view. Swipe sideways on your phone to see Monday–Friday. "
-        "Scheduled appointments and projected recurring clients are shown together."
+        "Each groomer has her own monthly planner. Swipe sideways on your phone "
+        "to see Monday–Friday."
     )
 
-    render_month_planner_board(
-        month_start,
-        month_end,
-        month_active,
-        projected_unscheduled,
-    )
+    jen_tab, haley_tab = st.tabs(["Jen", "Haley"])
+
+    with jen_tab:
+        jen_confirmed = month_active[
+            month_active.get(
+                "Groomer",
+                pd.Series([""] * len(month_active), index=month_active.index),
+            ).fillna("").astype(str).eq("Jen")
+        ].copy() if not month_active.empty else month_active.copy()
+
+        jen_projected = projected_unscheduled[
+            projected_unscheduled.get(
+                "Groomer",
+                pd.Series([""] * len(projected_unscheduled), index=projected_unscheduled.index),
+            ).fillna("").astype(str).eq("Jen")
+        ].copy() if not projected_unscheduled.empty else projected_unscheduled.copy()
+
+        j1, j2 = st.columns(2)
+        j1.metric("Jen appointments", len(jen_confirmed))
+        j2.metric(
+            "Jen scheduled revenue",
+            f"${float(jen_confirmed.get('Price', pd.Series(dtype=float)).sum()):,.0f}",
+        )
+
+        render_month_planner_board(
+            month_start,
+            month_end,
+            jen_confirmed,
+            jen_projected,
+        )
+
+    with haley_tab:
+        haley_confirmed = month_active[
+            month_active.get(
+                "Groomer",
+                pd.Series([""] * len(month_active), index=month_active.index),
+            ).fillna("").astype(str).eq("Haley")
+        ].copy() if not month_active.empty else month_active.copy()
+
+        haley_projected = projected_unscheduled[
+            projected_unscheduled.get(
+                "Groomer",
+                pd.Series([""] * len(projected_unscheduled), index=projected_unscheduled.index),
+            ).fillna("").astype(str).eq("Haley")
+        ].copy() if not projected_unscheduled.empty else projected_unscheduled.copy()
+
+        h1, h2 = st.columns(2)
+        h1.metric("Haley appointments", len(haley_confirmed))
+        h2.metric(
+            "Haley scheduled revenue",
+            f"${float(haley_confirmed.get('Price', pd.Series(dtype=float)).sum()):,.0f}",
+        )
+
+        render_month_planner_board(
+            month_start,
+            month_end,
+            haley_confirmed,
+            haley_projected,
+        )
+
+    either_projected = projected_unscheduled[
+        projected_unscheduled.get(
+            "Groomer",
+            pd.Series([""] * len(projected_unscheduled), index=projected_unscheduled.index),
+        ).fillna("").astype(str).eq("Either")
+    ].copy() if not projected_unscheduled.empty else pd.DataFrame()
+
+    if not either_projected.empty:
+        st.caption(
+            f"{len(either_projected)} projected stop(s) are marked Either and are not "
+            "placed on Jen or Haley's calendar until a groomer is assigned."
+        )
 
     unconfirmed_weeks = load_month_unconfirmed_drafts_db(
         month_start,
@@ -6440,7 +6506,7 @@ with monthly_tab:
                 + ". Confirm those weeks to place them on the monthly planner."
             )
 
-    with st.expander("Projected / unscheduled details", expanded=False):
+    with st.expander("All projected / unscheduled details", expanded=False):
         st.caption(
             "These are expected from recurring service schedules but are not appointments yet."
         )
@@ -8168,6 +8234,6 @@ with export_tab:
         st.code('GOOGLE_MAPS_API_KEY = "your-key-here"')
 
 st.caption(
-    "Mobile Grooming Planner v29 · private Supabase data · recurring service schedules · "
+    "Mobile Grooming Planner v30 · private Supabase data · recurring service schedules · "
     "weekly/monthly planning · completion tracking · optional Google Maps routing."
 )
