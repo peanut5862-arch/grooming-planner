@@ -15,12 +15,12 @@ except Exception:
     create_client = None
 
 st.set_page_config(
-    page_title="Mobile Grooming Planner v15.8",
+    page_title="Mobile Grooming Planner v16",
     page_icon="🐾",
     layout="wide",
 )
 
-st.title("🐾 Mobile Grooming Planner v15.8")
+st.title("🐾 Mobile Grooming Planner v16")
 st.caption("Private client manager + due-date intelligence + cancellation filling + optional real drive-time scoring.")
 
 WORKDAYS = {
@@ -1690,6 +1690,115 @@ def delete_week_draft_db(week_key):
     ).execute()
 
 
+def load_month_drafts_db(month_start, month_end):
+    """Load all saved weekly drafts that can contain dates inside a month."""
+    if not supabase_configured():
+        return []
+
+    try:
+        month_start = pd.Timestamp(month_start).normalize()
+        month_end = pd.Timestamp(month_end).normalize()
+
+        # Include the Monday that may start before the first day of the month.
+        query_start = (
+            month_start - pd.Timedelta(days=month_start.weekday())
+        ).date().isoformat()
+        query_end = month_end.date().isoformat()
+
+        return (
+            get_supabase()
+            .table("weekly_drafts")
+            .select("week_start,plan_json")
+            .gte("week_start", query_start)
+            .lte("week_start", query_end)
+            .order("week_start")
+            .execute()
+            .data
+            or []
+        )
+    except Exception:
+        return []
+
+
+def month_plan_dataframe(month_start, month_end):
+    """Flatten saved weekly drafts into one appointment table for a calendar month."""
+    month_start = pd.Timestamp(month_start).normalize()
+    month_end = pd.Timestamp(month_end).normalize()
+
+    records = []
+
+    for saved in load_month_drafts_db(month_start, month_end):
+        for item in saved.get("plan_json") or []:
+            owner = str(item.get("Owner", "") or "").strip()
+            household_id = str(item.get("Household ID", "") or "").strip()
+            raw_date = item.get("Date")
+
+            if not owner or not household_id or not raw_date:
+                continue
+
+            appt_date = pd.to_datetime(raw_date, errors="coerce")
+            if pd.isna(appt_date):
+                continue
+            appt_date = appt_date.normalize()
+
+            if not (month_start <= appt_date <= month_end):
+                continue
+
+            row = dict(item)
+            row["Date"] = appt_date.date()
+            row["Week Start"] = saved.get("week_start")
+            records.append(row)
+
+    # Include unsaved in-session drafts too, without duplicating DB records.
+    seen = {
+        (
+            str(r.get("Household ID", "")),
+            str(r.get("Date", "")),
+            str(r.get("Groomer", "")),
+        )
+        for r in records
+    }
+
+    for week_key, plan in st.session_state.get("week_route_plans", {}).items():
+        if plan is None or plan.empty:
+            continue
+        for _, row in plan.iterrows():
+            owner = str(row.get("Owner", "") or "").strip()
+            household_id = str(row.get("Household ID", "") or "").strip()
+            raw_date = row.get("Date")
+            if not owner or not household_id or raw_date is None:
+                continue
+            appt_date = pd.to_datetime(raw_date, errors="coerce")
+            if pd.isna(appt_date):
+                continue
+            appt_date = appt_date.normalize()
+            if not (month_start <= appt_date <= month_end):
+                continue
+            key = (household_id, str(appt_date.date()), str(row.get("Groomer", "")))
+            if key in seen:
+                continue
+            item = row.to_dict()
+            item["Date"] = appt_date.date()
+            item["Week Start"] = week_key
+            records.append(item)
+            seen.add(key)
+
+    if not records:
+        return pd.DataFrame(
+            columns=[
+                "Household ID", "Date", "Day", "Groomer", "Area Cluster",
+                "Owner", "Dogs", "Status", "Minutes", "Price", "Start Time",
+                "End Time", "Week Start",
+            ]
+        )
+
+    df = pd.DataFrame(records)
+    for col in ["Minutes", "Price"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+    return df
+
+
 def load_households_scheduled_before_week_db(week_key, lookback_weeks=4):
     """
     Return household IDs that are already placed in a saved weekly draft
@@ -2097,8 +2206,15 @@ appointments = st.session_state.appointments
 
 # ---------- Main tabs ----------
 
-planner_tab, weekly_tab, clients_tab, due_tab, export_tab = st.tabs(
-    ["📅 Planner", "🗓️ Weekly Route Builder", "👥 Client Manager", "⏰ Due List", "🔐 Private Data"]
+planner_tab, monthly_tab, weekly_tab, clients_tab, due_tab, export_tab = st.tabs(
+    [
+        "📅 Planner",
+        "🗓️ Monthly Planner",
+        "📆 Weekly Route Builder",
+        "👥 Client Manager",
+        "⏰ Due List",
+        "🔐 Private Data",
+    ]
 )
 
 # ---------- Planner ----------
@@ -2409,6 +2525,185 @@ def schedule_data_fingerprint(df):
         snap[c] = snap[c].astype(str)
     snap = snap.sort_values(cols, kind="stable").reset_index(drop=True)
     return str(int(pd.util.hash_pandas_object(snap, index=True).sum()))
+
+# ---------- Monthly Planner ----------
+
+with monthly_tab:
+    st.markdown("## Monthly planner")
+    st.caption(
+        "See the whole month at once. This page reads the weekly drafts you have saved "
+        "and keeps each week separate."
+    )
+
+    month_pick = st.date_input(
+        "Month",
+        value=st.session_state.get("monthly_planner_date", date.today()),
+        key="monthly_planner_date",
+    )
+    month_start = pd.Timestamp(month_pick).replace(day=1).normalize()
+    month_end = (
+        month_start + pd.offsets.MonthEnd(1)
+    ).normalize()
+
+    month_plan = month_plan_dataframe(month_start, month_end)
+
+    if month_plan.empty:
+        st.info(
+            "No saved appointments are on this month yet. Build a week in Weekly Route "
+            "Builder and it will appear here automatically."
+        )
+    else:
+        total_appts = len(month_plan)
+        total_revenue = float(month_plan.get("Price", pd.Series(dtype=float)).sum())
+        total_minutes = int(month_plan.get("Minutes", pd.Series(dtype=float)).sum())
+
+        mc1, mc2, mc3 = st.columns(3)
+        mc1.metric("Appointments", total_appts)
+        mc2.metric("Projected revenue", f"${total_revenue:,.0f}")
+        mc3.metric("Groom minutes", total_minutes)
+
+        st.markdown(f"### {month_start:%B %Y}")
+
+        # One compact section per calendar week. This keeps the full month visible
+        # without forcing a tiny 5-column phone layout.
+        month_plan["_Date Sort"] = pd.to_datetime(month_plan["Date"], errors="coerce")
+        monday_series = (
+            month_plan["_Date Sort"]
+            - pd.to_timedelta(month_plan["_Date Sort"].dt.weekday, unit="D")
+        )
+        month_plan["_Week Monday"] = monday_series.dt.date
+
+        for week_monday, week_group in month_plan.groupby("_Week Monday", sort=True):
+            week_monday_ts = pd.Timestamp(week_monday)
+            week_friday_ts = week_monday_ts + pd.Timedelta(days=4)
+            week_revenue = float(week_group["Price"].sum()) if "Price" in week_group.columns else 0
+            week_count = len(week_group)
+
+            st.markdown(
+                f"#### Week of {week_monday_ts:%b %d} "
+                f"· {week_count} appts · ${week_revenue:,.0f}"
+            )
+
+            for day_offset in range(5):
+                day_ts = week_monday_ts + pd.Timedelta(days=day_offset)
+                day_rows = week_group[
+                    pd.to_datetime(week_group["Date"]).dt.normalize()
+                    == day_ts.normalize()
+                ].copy()
+
+                if day_rows.empty:
+                    st.markdown(f"**{day_ts:%A · %b %d}** — _open_")
+                    continue
+
+                day_rows["_Start Sort"] = day_rows.get(
+                    "Start Time",
+                    pd.Series([""] * len(day_rows), index=day_rows.index),
+                ).apply(clock_sort_minutes)
+                day_rows = day_rows.sort_values(
+                    ["_Start Sort", "Groomer", "Owner"],
+                    kind="stable",
+                )
+
+                day_revenue = float(day_rows["Price"].sum()) if "Price" in day_rows.columns else 0
+                st.markdown(
+                    f"**{day_ts:%A · %b %d}** "
+                    f"· {len(day_rows)} appts · ${day_revenue:,.0f}"
+                )
+
+                for _, row in day_rows.iterrows():
+                    start_time = str(row.get("Start Time", "") or "")
+                    owner = str(row.get("Owner", "") or "")
+                    dogs = str(row.get("Dogs", "") or "")
+                    groomer = str(row.get("Groomer", "") or "")
+                    area = str(row.get("Area Cluster", "") or "")
+                    price = float(row.get("Price", 0) or 0)
+
+                    details = " · ".join(
+                        [part for part in [groomer, area] if part]
+                    )
+                    time_prefix = f"{start_time} · " if start_time else ""
+                    dog_text = f" / {dogs}" if dogs else ""
+
+                    st.markdown(
+                        f"- **{time_prefix}{owner}{dog_text}**"
+                        f"{' · ' + details if details else ''} · ${price:,.0f}"
+                    )
+
+            st.divider()
+
+    # Show who is due this month but not yet in any saved monthly appointment.
+    month_due = household_due_table(
+        st.session_state.clients,
+        month_start,
+    )
+
+    if not month_due.empty and "Days Until Due" in month_due.columns:
+        month_due = month_due.copy()
+        month_due["Due Date"] = month_due["Days Until Due"].apply(
+            lambda x: (
+                month_start + pd.Timedelta(days=float(x))
+                if pd.notna(x)
+                else pd.NaT
+            )
+        )
+
+        scheduled_hids = set(
+            month_plan.get("Household ID", pd.Series(dtype=str))
+            .dropna()
+            .astype(str)
+            .tolist()
+        )
+
+        unscheduled = month_due[
+            month_due["Due Date"].notna()
+            & (month_due["Due Date"] >= month_start)
+            & (month_due["Due Date"] <= month_end)
+            & (~month_due["Household ID"].astype(str).isin(scheduled_hids))
+        ].copy()
+
+        st.markdown("### Due this month but not scheduled")
+        if unscheduled.empty:
+            st.success("Everyone currently due this month is already on a saved week.")
+        else:
+            display_cols = [
+                c for c in [
+                    "Owner", "Dogs", "Area", "Groomer", "Due Date", "Status",
+                    "Minutes", "Price",
+                ]
+                if c in unscheduled.columns
+            ]
+            if "Due Date" in unscheduled.columns:
+                unscheduled["Due Date"] = pd.to_datetime(
+                    unscheduled["Due Date"], errors="coerce"
+                ).dt.date
+            st.dataframe(
+                unscheduled[display_cols].sort_values("Due Date"),
+                hide_index=True,
+                use_container_width=True,
+            )
+
+    st.markdown("### Jump to a week")
+    first_monday = month_start - pd.Timedelta(days=month_start.weekday())
+    week_choices = []
+    cursor = first_monday
+    while cursor <= month_end:
+        week_choices.append(cursor.date())
+        cursor += pd.Timedelta(days=7)
+
+    chosen_week = st.selectbox(
+        "Week",
+        week_choices,
+        format_func=lambda d: f"Week of {pd.Timestamp(d):%b %d}",
+        key="monthly_week_jump",
+    )
+
+    if st.button("Set Weekly Route Builder to this week"):
+        st.session_state["week_builder_date"] = chosen_week
+        st.success(
+            f"Weekly Route Builder is set to the week of "
+            f"{pd.Timestamp(chosen_week):%B %d}. Tap the Weekly Route Builder tab."
+        )
+
 
 with weekly_tab:
     st.info(
