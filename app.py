@@ -15,12 +15,12 @@ except Exception:
     create_client = None
 
 st.set_page_config(
-    page_title="Mobile Grooming Planner v15",
+    page_title="Mobile Grooming Planner v15.1",
     page_icon="🐾",
     layout="wide",
 )
 
-st.title("🐾 Mobile Grooming Planner v15")
+st.title("🐾 Mobile Grooming Planner v15.1")
 st.caption("Private client manager + due-date intelligence + cancellation filling + optional real drive-time scoring.")
 
 WORKDAYS = {
@@ -2156,6 +2156,33 @@ def household_member_detail(dog_df, household_id):
 
 if "week_client_responses" not in st.session_state:
     st.session_state.week_client_responses = {}
+if "week_route_plans" not in st.session_state:
+    st.session_state.week_route_plans = {}
+if "week_builder_settings" not in st.session_state:
+    st.session_state.week_builder_settings = {}
+if "week_plan_fingerprints" not in st.session_state:
+    st.session_state.week_plan_fingerprints = {}
+
+def schedule_data_fingerprint(df):
+    if df is None or df.empty:
+        return "empty"
+
+    cols = [
+        c for c in [
+            "Owner", "Dog", "Household ID", "Area", "Groomer",
+            "Last Groom", "Frequency Weeks", "Service Pattern",
+            "Bath Frequency Weeks", "Last Bath",
+            "Groom Frequency Weeks", "Last Groom Service",
+            "Bath Price", "Bath Minutes", "Groom Price", "Groom Minutes",
+            "Price", "Minutes",
+        ]
+        if c in df.columns
+    ]
+    snap = df[cols].copy()
+    for c in snap.columns:
+        snap[c] = snap[c].astype(str)
+    snap = snap.sort_values(cols, kind="stable").reset_index(drop=True)
+    return str(int(pd.util.hash_pandas_object(snap, index=True).sum()))
 
 with weekly_tab:
     st.info(
@@ -2176,7 +2203,7 @@ with weekly_tab:
 
     week_start_input = st.date_input(
         "Week of",
-        value=date.today(),
+        value=st.session_state.get("week_builder_date", date.today()),
         key="week_builder_date",
     )
 
@@ -2184,25 +2211,52 @@ with weekly_tab:
         days=pd.Timestamp(week_start_input).weekday()
     )
     week_key = selected_week_monday.date().isoformat()
+
     if week_key not in st.session_state.week_client_responses:
         st.session_state.week_client_responses[week_key] = {}
     week_overrides = st.session_state.week_client_responses[week_key]
 
+    default_settings = {
+        "daily_capacity": 420,
+        "max_appointments": 4,
+        "jen_start": time(8, 0),
+        "haley_start": time(8, 0),
+        "travel_buffer": 20,
+        "service_buffer": 0,
+    }
+    saved_settings = st.session_state.week_builder_settings.get(
+        week_key, default_settings.copy()
+    )
+
     c1, c2 = st.columns(2)
 
     with c1:
+        capacity_options = [300, 360, 420, 480, 540]
+        saved_capacity = int(saved_settings.get("daily_capacity", 420))
         daily_capacity = st.selectbox(
             "Approximate grooming minutes available per groomer/day",
-            [300, 360, 420, 480, 540],
-            index=2,
+            capacity_options,
+            index=(
+                capacity_options.index(saved_capacity)
+                if saved_capacity in capacity_options
+                else 2
+            ),
             format_func=lambda x: f"{x} minutes ({x/60:.1f} hrs)",
+            key=f"daily_capacity_{week_key}",
         )
 
     with c2:
+        appt_options = [3, 4, 5, 6]
+        saved_appts = int(saved_settings.get("max_appointments", 4))
         max_appointments = st.selectbox(
             "Maximum appointments per groomer/day",
-            [3, 4, 5, 6],
-            index=1,
+            appt_options,
+            index=(
+                appt_options.index(saved_appts)
+                if saved_appts in appt_options
+                else 1
+            ),
+            key=f"max_appointments_{week_key}",
         )
 
     st.markdown("#### Time assumptions")
@@ -2212,50 +2266,118 @@ with weekly_tab:
     with t1:
         jen_start = st.time_input(
             "Jen start time",
-            value=time(8, 0),
-            key="jen_week_start",
+            value=saved_settings.get("jen_start", time(8, 0)),
+            key=f"jen_week_start_{week_key}",
         )
 
     with t2:
         haley_start = st.time_input(
             "Haley start time",
-            value=time(8, 0),
-            key="haley_week_start",
+            value=saved_settings.get("haley_start", time(8, 0)),
+            key=f"haley_week_start_{week_key}",
         )
 
     t3, t4 = st.columns(2)
 
     with t3:
+        travel_options = [10, 15, 20, 25, 30, 45]
+        saved_travel = int(saved_settings.get("travel_buffer", 20))
         travel_buffer = st.selectbox(
             "Travel / setup buffer",
-            [10, 15, 20, 25, 30, 45],
-            index=2,
+            travel_options,
+            index=(
+                travel_options.index(saved_travel)
+                if saved_travel in travel_options
+                else 2
+            ),
             format_func=lambda x: f"{x} min",
+            key=f"travel_buffer_{week_key}",
         )
 
     with t4:
+        service_options = [0, 5, 10, 15]
+        saved_service = int(saved_settings.get("service_buffer", 0))
         service_buffer = st.selectbox(
             "Extra service buffer per household",
-            [0, 5, 10, 15],
-            index=0,
+            service_options,
+            index=(
+                service_options.index(saved_service)
+                if saved_service in service_options
+                else 0
+            ),
             format_func=lambda x: f"{x} min",
+            key=f"service_buffer_{week_key}",
         )
 
-    weekly_plan = build_week_plan(
-        st.session_state.clients,
-        pd.Timestamp(week_start_input),
-        daily_capacity_minutes=daily_capacity,
-        max_appointments_per_day=max_appointments,
-        week_overrides=week_overrides,
-    )
+    current_settings = {
+        "daily_capacity": daily_capacity,
+        "max_appointments": max_appointments,
+        "jen_start": jen_start,
+        "haley_start": haley_start,
+        "travel_buffer": travel_buffer,
+        "service_buffer": service_buffer,
+    }
+    st.session_state.week_builder_settings[week_key] = current_settings
 
-    weekly_plan = assign_times_to_weekly_plan(
-        weekly_plan,
-        jen_start=jen_start,
-        haley_start=haley_start,
-        travel_buffer_minutes=travel_buffer,
-        service_buffer_minutes=service_buffer,
-    )
+    build_col1, build_col2 = st.columns(2)
+    with build_col1:
+        rebuild_week = st.button(
+            "Generate / rebuild week",
+            type="primary",
+            key=f"rebuild_week_{week_key}",
+        )
+    with build_col2:
+        if st.button(
+            "Reset this week",
+            key=f"reset_week_{week_key}",
+        ):
+            st.session_state.week_route_plans.pop(week_key, None)
+            st.session_state.week_plan_fingerprints.pop(week_key, None)
+            st.session_state.week_client_responses[week_key] = {}
+            st.session_state.week_builder_settings[week_key] = default_settings.copy()
+            for key in [
+                f"daily_capacity_{week_key}",
+                f"max_appointments_{week_key}",
+                f"jen_week_start_{week_key}",
+                f"haley_week_start_{week_key}",
+                f"travel_buffer_{week_key}",
+                f"service_buffer_{week_key}",
+            ]:
+                st.session_state.pop(key, None)
+            st.rerun()
+
+    current_fingerprint = schedule_data_fingerprint(st.session_state.clients)
+
+    # Generate once for a brand-new week, then keep that draft until the user
+    # explicitly rebuilds it. Tab changes no longer reset/recalculate the plan.
+    if rebuild_week or week_key not in st.session_state.week_route_plans:
+        weekly_plan = build_week_plan(
+            st.session_state.clients,
+            pd.Timestamp(week_start_input),
+            daily_capacity_minutes=daily_capacity,
+            max_appointments_per_day=max_appointments,
+            week_overrides=week_overrides,
+        )
+
+        weekly_plan = assign_times_to_weekly_plan(
+            weekly_plan,
+            jen_start=jen_start,
+            haley_start=haley_start,
+            travel_buffer_minutes=travel_buffer,
+            service_buffer_minutes=service_buffer,
+        )
+
+        st.session_state.week_route_plans[week_key] = weekly_plan
+        st.session_state.week_plan_fingerprints[week_key] = current_fingerprint
+    else:
+        weekly_plan = st.session_state.week_route_plans[week_key].copy()
+
+    saved_fingerprint = st.session_state.week_plan_fingerprints.get(week_key)
+    if saved_fingerprint and saved_fingerprint != current_fingerprint:
+        st.warning(
+            "Client data has changed since this weekly draft was generated. "
+            "Your saved draft is still shown. Tap Generate / rebuild week when you want to update it."
+        )
 
     if weekly_plan.empty:
         st.info("No clients are currently due enough to build a week.")
@@ -2349,11 +2471,48 @@ with weekly_tab:
                         "requested_day": requested_day,
                     }
                     st.session_state.week_client_responses[week_key] = week_overrides
+
+                    adjusted_plan = build_week_plan(
+                        st.session_state.clients,
+                        pd.Timestamp(week_start_input),
+                        daily_capacity_minutes=daily_capacity,
+                        max_appointments_per_day=max_appointments,
+                        week_overrides=week_overrides,
+                    )
+                    adjusted_plan = assign_times_to_weekly_plan(
+                        adjusted_plan,
+                        jen_start=jen_start,
+                        haley_start=haley_start,
+                        travel_buffer_minutes=travel_buffer,
+                        service_buffer_minutes=service_buffer,
+                    )
+                    st.session_state.week_route_plans[week_key] = adjusted_plan
+                    st.session_state.week_plan_fingerprints[week_key] = (
+                        schedule_data_fingerprint(st.session_state.clients)
+                    )
                     st.rerun()
 
             with c_reply2:
                 if st.button("Clear this week's changes"):
                     st.session_state.week_client_responses[week_key] = {}
+                    cleared_plan = build_week_plan(
+                        st.session_state.clients,
+                        pd.Timestamp(week_start_input),
+                        daily_capacity_minutes=daily_capacity,
+                        max_appointments_per_day=max_appointments,
+                        week_overrides={},
+                    )
+                    cleared_plan = assign_times_to_weekly_plan(
+                        cleared_plan,
+                        jen_start=jen_start,
+                        haley_start=haley_start,
+                        travel_buffer_minutes=travel_buffer,
+                        service_buffer_minutes=service_buffer,
+                    )
+                    st.session_state.week_route_plans[week_key] = cleared_plan
+                    st.session_state.week_plan_fingerprints[week_key] = (
+                        schedule_data_fingerprint(st.session_state.clients)
+                    )
                     st.rerun()
 
             if week_overrides:
