@@ -16,12 +16,12 @@ except Exception:
     create_client = None
 
 st.set_page_config(
-    page_title="Mobile Grooming Planner v24",
+    page_title="Mobile Grooming Planner v24.1",
     page_icon="🐾",
     layout="wide",
 )
 
-st.title("🐾 Mobile Grooming Planner v24")
+st.title("🐾 Mobile Grooming Planner v24.1")
 st.caption("Private client manager + due-date intelligence + weekly routing + real Google Maps drive-time optimization.")
 
 WORKDAYS = {
@@ -162,25 +162,42 @@ def geocode_address(full_address, key):
     loc = result["results"][0]["geometry"]["location"]
     return loc["lat"], loc["lng"]
 
+def _routes_waypoint(value):
+    """
+    Build a Routes API waypoint from either:
+    - (latitude, longitude), or
+    - a saved street-address string.
+    """
+    if isinstance(value, str):
+        address = value.strip()
+        if not address:
+            return None
+        return {"address": address}
+
+    if isinstance(value, (list, tuple)) and len(value) >= 2:
+        return {
+            "location": {
+                "latLng": {
+                    "latitude": float(value[0]),
+                    "longitude": float(value[1]),
+                }
+            }
+        }
+
+    return None
+
+
 def route_metrics(origin, destination, key):
+    origin_waypoint = _routes_waypoint(origin)
+    destination_waypoint = _routes_waypoint(destination)
+
+    if origin_waypoint is None or destination_waypoint is None:
+        return None, None
+
     url = "https://routes.googleapis.com/directions/v2:computeRoutes"
     payload = {
-        "origin": {
-            "location": {
-                "latLng": {
-                    "latitude": float(origin[0]),
-                    "longitude": float(origin[1]),
-                }
-            }
-        },
-        "destination": {
-            "location": {
-                "latLng": {
-                    "latitude": float(destination[0]),
-                    "longitude": float(destination[1]),
-                }
-            }
-        },
+        "origin": origin_waypoint,
+        "destination": destination_waypoint,
         "travelMode": "DRIVE",
         "routingPreference": "TRAFFIC_AWARE",
         "units": "IMPERIAL",
@@ -213,19 +230,36 @@ def route_metrics(origin, destination, key):
     return miles, minutes
 
 
-def _household_client_rows(household_id):
+def _household_client_rows(household_id, owner=None):
     clients_df = st.session_state.get("clients", pd.DataFrame())
     if clients_df is None or clients_df.empty:
         return pd.DataFrame()
 
-    return clients_df[
-        clients_df["Household ID"].astype(str).str.strip()
-        == str(household_id or "").strip()
-    ].copy()
+    hid = str(household_id or "").strip()
+
+    if hid and hid.lower() not in {"nan", "none"}:
+        matches = clients_df[
+            clients_df["Household ID"].astype(str).str.strip() == hid
+        ].copy()
+        if not matches.empty:
+            return matches
+
+    # Defensive fallback for older/migrated weekly drafts whose Household ID
+    # may not exactly match the current client table.
+    owner_text = str(owner or "").strip()
+    if owner_text and "Owner" in clients_df.columns:
+        matches = clients_df[
+            clients_df["Owner"].astype(str).str.strip().str.casefold()
+            == owner_text.casefold()
+        ].copy()
+        if not matches.empty:
+            return matches
+
+    return pd.DataFrame()
 
 
-def household_address(household_id):
-    rows = _household_client_rows(household_id)
+def household_address(household_id, owner=None):
+    rows = _household_client_rows(household_id, owner=owner)
     if rows.empty:
         return ""
 
@@ -236,13 +270,20 @@ def household_address(household_id):
     return ""
 
 
-def household_coords(household_id, maps_key=None, geocode_if_missing=False):
+def household_coords(
+    household_id,
+    maps_key=None,
+    geocode_if_missing=False,
+    owner=None,
+):
     """
-    Return one lat/lon pair for a household.
-    If requested, geocode the saved address and persist the coordinates so
-    later route calculations do not have to geocode the household again.
+    Return one lat/lon pair for a household when available.
+
+    Geocoding is still attempted so we can cache coordinates, but v24.1 no
+    longer requires geocoding to succeed for routing: the Routes API can route
+    directly from the saved address string.
     """
-    rows = _household_client_rows(household_id)
+    rows = _household_client_rows(household_id, owner=owner)
     if rows.empty:
         return None
 
@@ -255,20 +296,34 @@ def household_coords(household_id, maps_key=None, geocode_if_missing=False):
     if not (geocode_if_missing and maps_key):
         return None
 
-    address = household_address(household_id)
+    address = household_address(household_id, owner=owner)
     if not address:
         return None
 
-    lat, lon = geocode_address(address, maps_key)
+    try:
+        lat, lon = geocode_address(address, maps_key)
+    except Exception:
+        return None
+
     if lat is None or lon is None:
         return None
 
     # Cache in session and persist to each dog record in the household.
     clients_df = st.session_state.clients.copy()
-    mask = (
-        clients_df["Household ID"].astype(str).str.strip()
-        == str(household_id or "").strip()
-    )
+
+    hid = str(household_id or "").strip()
+    if hid and hid.lower() not in {"nan", "none"}:
+        mask = (
+            clients_df["Household ID"].astype(str).str.strip()
+            == hid
+        )
+    else:
+        owner_text = str(owner or "").strip()
+        mask = (
+            clients_df["Owner"].astype(str).str.strip().str.casefold()
+            == owner_text.casefold()
+        )
+
     clients_df.loc[mask, "Latitude"] = float(lat)
     clients_df.loc[mask, "Longitude"] = float(lon)
     st.session_state.clients = clients_df
@@ -293,6 +348,44 @@ def household_coords(household_id, maps_key=None, geocode_if_missing=False):
                 )
 
     return float(lat), float(lon)
+
+
+def household_route_point(household_id, maps_key=None, owner=None):
+    """
+    Return the best routable representation for Google Routes.
+
+    Prefer saved/cached coordinates. If Geocoding cannot produce coordinates,
+    fall back to the saved address string and let Routes API geocode it
+    directly. This mirrors why an address can work in Google Maps even when
+    our separate Geocoding request failed.
+    """
+    coords = household_coords(
+        household_id,
+        maps_key=maps_key,
+        geocode_if_missing=True,
+        owner=owner,
+    )
+    if coords is not None:
+        return coords
+
+    address = household_address(household_id, owner=owner)
+    if address:
+        return address
+
+    return None
+
+
+def get_groomer_home_route_point(groomer, maps_key):
+    """
+    Prefer cached home coordinates, but fall back to the private home address
+    string so Routes API can geocode it directly.
+    """
+    coords = get_groomer_home_coords(groomer, maps_key)
+    if coords is not None:
+        return coords
+
+    address = get_groomer_home_address(groomer)
+    return address or None
 
 
 def _best_route_order(
@@ -578,10 +671,10 @@ def optimize_week_with_google_maps(
 
         for row_index, row in group.iterrows():
             hid = row.get("Household ID")
-            point = household_coords(
+            point = household_route_point(
                 hid,
                 maps_key=maps_key,
-                geocode_if_missing=True,
+                owner=row.get("Owner"),
             )
             if point is None:
                 missing.append(
@@ -598,15 +691,9 @@ def optimize_week_with_google_maps(
             )
 
         home_address = get_groomer_home_address(groomer)
-        home_coord = get_groomer_home_coords(groomer, maps_key)
+        home_coord = get_groomer_home_route_point(groomer, maps_key)
 
-        if home_address and home_coord is None:
-            routing_notes.append(
-                f"{pd.Timestamp(day_date):%a %b %d} · {groomer}: "
-                "the private home address could not be geocoded, so this day was "
-                "optimized between clients only."
-            )
-        elif not home_address:
+        if not home_address:
             routing_notes.append(
                 f"{pd.Timestamp(day_date):%a %b %d} · {groomer}: "
                 "no private home address is configured, so this day was optimized "
@@ -694,8 +781,8 @@ def optimize_week_with_google_maps(
         for idx in unroutable:
             if locked_time_minutes(optimized.at[idx, "Locked Time"]) is not None:
                 raise ValueError(
-                    f"{optimized.at[idx, 'Owner']} has an exact time but no "
-                    "routable address. Add/fix the address before optimizing."
+                    f"{optimized.at[idx, 'Owner']} has an exact time but the "
+                    "app could not find a usable saved address for that client."
                 )
 
         final_order = list(best_order) + list(unroutable)
@@ -823,7 +910,10 @@ def google_maps_route_url(day_group, groomer=None):
 
     addresses = []
     for _, row in group.iterrows():
-        address = household_address(row.get("Household ID"))
+        address = household_address(
+            row.get("Household ID"),
+            owner=row.get("Owner"),
+        )
         if address and address not in addresses:
             addresses.append(address)
 
@@ -1826,10 +1916,16 @@ def render_weekly_cards(valid_plan, daily_capacity, travel_buffer):
 
         st.divider()
 
-    st.caption(
-        "All scheduled workdays are shown together. Travel/setup time is still "
-        "an estimate until real map routing is connected."
-    )
+    if get_maps_key():
+        st.caption(
+            "All scheduled workdays are shown together. After you optimize the "
+            "week, drive times and route order use Google Maps."
+        )
+    else:
+        st.caption(
+            "All scheduled workdays are shown together. Travel/setup time is an "
+            "estimate until Google Maps routing is connected."
+        )
 
 
 def schedule_score(row):
@@ -7201,6 +7297,6 @@ with export_tab:
         st.code('GOOGLE_MAPS_API_KEY = "your-key-here"')
 
 st.caption(
-    "Mobile Grooming Planner v24 · private Supabase data · recurring service schedules · "
+    "Mobile Grooming Planner v24.1 · private Supabase data · recurring service schedules · "
     "weekly/monthly planning · completion tracking · optional Google Maps routing."
 )
