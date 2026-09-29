@@ -16,12 +16,12 @@ except Exception:
     create_client = None
 
 st.set_page_config(
-    page_title="Mobile Grooming Planner v24.3",
+    page_title="Mobile Grooming Planner v24.4",
     page_icon="🐾",
     layout="wide",
 )
 
-st.title("🐾 Mobile Grooming Planner v24.3")
+st.title("🐾 Mobile Grooming Planner v24.4")
 st.caption("Private client manager + due-date intelligence + weekly routing + real Google Maps drive-time optimization.")
 
 WORKDAYS = {
@@ -512,6 +512,7 @@ def _best_timed_route_order(
     first_arrival_time,
     service_buffer_minutes=0,
     has_home=False,
+    fallback_travel_minutes=20,
 ):
     """
     Choose a feasible route while honoring exact appointment times.
@@ -570,11 +571,12 @@ def _best_timed_route_order(
             else:
                 metric = pair_metrics.get((previous, idx))
                 if metric is None:
-                    # This order cannot be safely timed if the travel leg is
-                    # unknown.
-                    return None
-
-                drive_min = float(metric[1])
+                    # Do not reject a promised appointment just because one
+                    # Google leg failed to return. Use the planner's normal
+                    # fallback travel buffer for that leg and keep going.
+                    drive_min = float(fallback_travel_minutes)
+                else:
+                    drive_min = float(metric[1])
                 total_drive += drive_min
                 earliest = current_end + drive_min
 
@@ -642,6 +644,7 @@ def optimize_week_with_google_maps(
     jen_start,
     haley_start,
     service_buffer_minutes=0,
+    fallback_travel_minutes=20,
 ):
     """
     Optimize each groomer/day using real road drive times.
@@ -776,6 +779,7 @@ def optimize_week_with_google_maps(
                     first_arrival_time,
                     service_buffer_minutes=service_buffer_minutes,
                     has_home=home_coord is not None,
+                    fallback_travel_minutes=fallback_travel_minutes,
                 )
 
                 if best_order is None:
@@ -786,8 +790,8 @@ def optimize_week_with_google_maps(
                     ]
                     raise ValueError(
                         f"{groomer} on {pd.Timestamp(day_date):%A %b %d} "
-                        "still cannot reach the locked appointment time(s) after "
-                        "trying the available route orders: "
+                        "has multiple time constraints that cannot all fit with "
+                        "the current service lengths and known drive times: "
                         + ", ".join(locked_names)
                     )
             else:
@@ -831,6 +835,8 @@ def optimize_week_with_google_maps(
                 metric = pair_metrics.get((previous_idx, row_index))
                 if metric is not None:
                     drive_miles, drive_minutes = metric
+                else:
+                    drive_minutes = float(fallback_travel_minutes)
 
             if row_index in timed_schedule:
                 start_minutes = timed_schedule[row_index]["start"]
@@ -5458,6 +5464,7 @@ with weekly_tab:
                             jen_start=jen_start,
                             haley_start=haley_start,
                             service_buffer_minutes=service_buffer,
+                            fallback_travel_minutes=travel_buffer,
                         )
 
                     st.session_state.week_route_plans[week_key] = routed_plan
@@ -5634,6 +5641,7 @@ with weekly_tab:
                             jen_start=jen_start,
                             haley_start=haley_start,
                             service_buffer_minutes=service_buffer,
+                            fallback_travel_minutes=travel_buffer,
                         )
                         plan_with_lock = routed_plan
                         for note in routing_notes:
@@ -7322,6 +7330,6 @@ with export_tab:
         st.code('GOOGLE_MAPS_API_KEY = "your-key-here"')
 
 st.caption(
-    "Mobile Grooming Planner v24.3 · private Supabase data · recurring service schedules · "
+    "Mobile Grooming Planner v24.4 · private Supabase data · recurring service schedules · "
     "weekly/monthly planning · completion tracking · optional Google Maps routing."
 )
