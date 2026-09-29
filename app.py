@@ -16,12 +16,12 @@ except Exception:
     create_client = None
 
 st.set_page_config(
-    page_title="Mobile Grooming Planner v24.4",
+    page_title="Mobile Grooming Planner v24.5",
     page_icon="🐾",
     layout="wide",
 )
 
-st.title("🐾 Mobile Grooming Planner v24.4")
+st.title("🐾 Mobile Grooming Planner v24.5")
 st.caption("Private client manager + due-date intelligence + weekly routing + real Google Maps drive-time optimization.")
 
 WORKDAYS = {
@@ -228,6 +228,86 @@ def route_metrics(origin, destination, key):
         minutes = None
 
     return miles, minutes
+
+
+def route_legs_for_sequence(points, key):
+    """
+    Calculate the actual Google Routes legs for one ordered day in ONE request.
+
+    points is an ordered list such as:
+      [home, client1, client2, client3, home]
+
+    Returns one (miles, minutes) tuple for each consecutive leg.
+    This is more reliable than relying only on many separate pairwise requests
+    and ensures the displayed drive minutes/miles match the final route.
+    """
+    points = [p for p in points if p is not None]
+    if len(points) < 2:
+        return []
+
+    waypoints = [_routes_waypoint(p) for p in points]
+    if any(wp is None for wp in waypoints):
+        return []
+
+    payload = {
+        "origin": waypoints[0],
+        "destination": waypoints[-1],
+        "travelMode": "DRIVE",
+        "routingPreference": "TRAFFIC_AWARE",
+        "units": "IMPERIAL",
+        "languageCode": "en-US",
+        "regionCode": "US",
+    }
+
+    if len(waypoints) > 2:
+        payload["intermediates"] = waypoints[1:-1]
+
+    headers = {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": key,
+        "X-Goog-FieldMask": (
+            "routes.legs.duration,routes.legs.distanceMeters"
+        ),
+    }
+
+    try:
+        result = get_json(
+            "https://routes.googleapis.com/directions/v2:computeRoutes",
+            headers=headers,
+            data=json.dumps(payload).encode("utf-8"),
+        )
+    except Exception:
+        # Retry without live traffic. This still returns real road mileage and
+        # average road-network travel time, and is less likely to fail.
+        payload["routingPreference"] = "TRAFFIC_UNAWARE"
+        try:
+            result = get_json(
+                "https://routes.googleapis.com/directions/v2:computeRoutes",
+                headers=headers,
+                data=json.dumps(payload).encode("utf-8"),
+            )
+        except Exception:
+            return []
+
+    routes = result.get("routes", [])
+    if not routes:
+        return []
+
+    legs = routes[0].get("legs", [])
+    output = []
+
+    for leg in legs:
+        miles = float(leg.get("distanceMeters", 0) or 0) / 1609.344
+        duration = str(leg.get("duration", "0s") or "0s").replace("s", "")
+        try:
+            minutes = float(duration) / 60.0
+        except Exception:
+            minutes = 0.0
+
+        output.append((miles, minutes))
+
+    return output
+
 
 
 def _household_client_rows(household_id, owner=None):
@@ -814,6 +894,25 @@ def optimize_week_with_google_maps(
                 )
 
         final_order = list(best_order) + list(unroutable)
+
+        # Recalculate the FINAL ordered route in one Google request so the
+        # displayed miles/minutes are true route legs, not fallback placeholders.
+        final_route_points = []
+        if home_coord is not None:
+            final_route_points.append(home_coord)
+
+        for row_index in final_order:
+            if row_index in coords:
+                final_route_points.append(coords[row_index])
+
+        if home_coord is not None:
+            final_route_points.append(home_coord)
+
+        final_leg_metrics = route_legs_for_sequence(
+            final_route_points,
+            maps_key,
+        )
+
         current_time = first_arrival_time
         previous_idx = None
 
@@ -827,10 +926,27 @@ def optimize_week_with_google_maps(
             drive_miles = 0.0
             drive_minutes = 0.0
 
-            if previous_idx is None and home_coord is not None:
+            # Prefer the actual leg from the final multi-stop Google route.
+            # With home routing, leg 0 is home -> first client. Without home,
+            # the first client has no incoming route leg.
+            if home_coord is not None:
+                incoming_leg_index = position - 1
+            else:
+                incoming_leg_index = position - 2
+
+            if (
+                incoming_leg_index >= 0
+                and incoming_leg_index < len(final_leg_metrics)
+            ):
+                drive_miles, drive_minutes = final_leg_metrics[
+                    incoming_leg_index
+                ]
+            elif previous_idx is None and home_coord is not None:
                 metric = start_metrics.get(row_index)
                 if metric is not None:
                     drive_miles, drive_minutes = metric
+                else:
+                    drive_minutes = float(fallback_travel_minutes)
             elif previous_idx is not None:
                 metric = pair_metrics.get((previous_idx, row_index))
                 if metric is not None:
@@ -838,29 +954,46 @@ def optimize_week_with_google_maps(
                 else:
                     drive_minutes = float(fallback_travel_minutes)
 
-            if row_index in timed_schedule:
-                start_minutes = timed_schedule[row_index]["start"]
-                end_minutes = timed_schedule[row_index]["end"]
-                start_t = minutes_to_time(start_minutes)
-                end_t = minutes_to_time(end_minutes)
+            duration = pd.to_numeric(
+                optimized.at[row_index, "Minutes"],
+                errors="coerce",
+            )
+            duration = int(duration) if pd.notna(duration) else 0
+
+            locked_minutes = locked_time_minutes(
+                optimized.at[row_index, "Locked Time"]
+            )
+
+            if position == 1:
+                if locked_minutes is not None:
+                    start_t = minutes_to_time(locked_minutes)
+                else:
+                    start_t = first_arrival_time
             else:
-                # Normal flexible timing. First stop begins at the configured
-                # first-stop arrival time; later stops add actual drive time.
-                if previous_idx is not None:
-                    current_time = add_minutes_to_time(
-                        current_time,
-                        int(round(drive_minutes)),
-                    )
-                duration = pd.to_numeric(
-                    optimized.at[row_index, "Minutes"],
-                    errors="coerce",
+                earliest_t = add_minutes_to_time(
+                    current_time,
+                    int(round(drive_minutes)),
                 )
-                duration = int(duration) if pd.notna(duration) else 0
-                start_t = current_time
-                end_t = add_minutes_to_time(
-                    start_t,
-                    duration + int(service_buffer_minutes),
+                earliest_minutes = (
+                    earliest_t.hour * 60 + earliest_t.minute
                 )
+
+                if locked_minutes is not None:
+                    if earliest_minutes > locked_minutes:
+                        raise ValueError(
+                            f"{optimized.at[row_index, 'Owner']} is locked at "
+                            f"{format_clock(minutes_to_time(locked_minutes))}, "
+                            "but the actual Google drive time would make the "
+                            "route arrive late."
+                        )
+                    start_t = minutes_to_time(locked_minutes)
+                else:
+                    start_t = earliest_t
+
+            end_t = add_minutes_to_time(
+                start_t,
+                duration + int(service_buffer_minutes),
+            )
 
             # Work backward from the actual first appointment time to calculate
             # the required leave-home time.
@@ -895,17 +1028,29 @@ def optimize_week_with_google_maps(
             previous_idx = row_index
 
         # Add the final client's return-home leg for totals/display.
-        if best_order and home_coord is not None:
-            last_idx = best_order[-1]
-            return_metric = end_metrics.get(last_idx)
-            if return_metric is not None:
-                return_miles, return_minutes = return_metric
+        if final_order and home_coord is not None:
+            last_idx = final_order[-1]
+
+            # Sequence is home -> clients -> home, so the final route leg is
+            # the last client -> home.
+            if len(final_leg_metrics) >= len(final_order) + 1:
+                return_miles, return_minutes = final_leg_metrics[-1]
                 optimized.at[last_idx, "Drive Home After Min"] = round(
                     return_minutes, 1
                 )
                 optimized.at[last_idx, "Drive Home After Miles"] = round(
                     return_miles, 1
                 )
+            else:
+                return_metric = end_metrics.get(last_idx)
+                if return_metric is not None:
+                    return_miles, return_minutes = return_metric
+                    optimized.at[last_idx, "Drive Home After Min"] = round(
+                        return_minutes, 1
+                    )
+                    optimized.at[last_idx, "Drive Home After Miles"] = round(
+                        return_miles, 1
+                    )
 
     return optimized, routing_notes
 
@@ -7330,6 +7475,6 @@ with export_tab:
         st.code('GOOGLE_MAPS_API_KEY = "your-key-here"')
 
 st.caption(
-    "Mobile Grooming Planner v24.4 · private Supabase data · recurring service schedules · "
+    "Mobile Grooming Planner v24.5 · private Supabase data · recurring service schedules · "
     "weekly/monthly planning · completion tracking · optional Google Maps routing."
 )
