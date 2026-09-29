@@ -15,12 +15,12 @@ except Exception:
     create_client = None
 
 st.set_page_config(
-    page_title="Mobile Grooming Planner v18.1",
+    page_title="Mobile Grooming Planner v18.2",
     page_icon="🐾",
     layout="wide",
 )
 
-st.title("🐾 Mobile Grooming Planner v18.1")
+st.title("🐾 Mobile Grooming Planner v18.2")
 st.caption("Private client manager + due-date intelligence + cancellation filling + optional real drive-time scoring.")
 
 WORKDAYS = {
@@ -1881,7 +1881,75 @@ def _advance_due_into_window(last_date, weeks, window_start):
     return None
 
 
-def projected_month_services(dog_df, month_start, month_end):
+
+def confirmed_service_history(up_to_date, lookback_days=1095):
+    """
+    Return the latest confirmed Bath/Groom appointment date by
+    (household_id, dog_name, service).
+
+    This lets future projections restart from appointments that were actually
+    confirmed in the planner instead of relying only on stale Last Bath /
+    Last Groom fields in the client record.
+    """
+    history = {}
+
+    if not supabase_configured():
+        return history
+
+    up_to = pd.Timestamp(up_to_date).normalize()
+    query_start = (up_to - pd.Timedelta(days=lookback_days)).date().isoformat()
+    query_end = up_to.date().isoformat()
+
+    try:
+        rows = (
+            get_supabase()
+            .table("weekly_drafts")
+            .select("week_start,plan_json,status")
+            .gte("week_start", query_start)
+            .lte("week_start", query_end)
+            .eq("status", "confirmed")
+            .execute()
+            .data
+            or []
+        )
+    except Exception:
+        return history
+
+    label_re = re.compile(r"^\s*(.*?)\s*\((Bath|Groom)\)\s*$", re.IGNORECASE)
+
+    for saved in rows:
+        for item in saved.get("plan_json") or []:
+            hid = str(item.get("Household ID", "") or "").strip()
+            raw_date = item.get("Date")
+            dogs_text = str(item.get("Dogs", "") or "").strip()
+
+            if not hid or not raw_date or not dogs_text:
+                continue
+
+            appt_date = pd.to_datetime(raw_date, errors="coerce")
+            if pd.isna(appt_date):
+                continue
+            appt_date = appt_date.normalize()
+
+            # Weekly plan stores household dogs like:
+            # "Lulu (Bath)" or "Dood 1 (Groom), Dood 2 (Groom)".
+            for label in [part.strip() for part in dogs_text.split(",") if part.strip()]:
+                match = label_re.match(label)
+                if not match:
+                    continue
+
+                dog_name = match.group(1).strip()
+                service = match.group(2).title()
+                key = (hid, dog_name.casefold(), service)
+
+                prior = history.get(key)
+                if prior is None or appt_date > prior:
+                    history[key] = appt_date
+
+    return history
+
+
+def projected_month_services(dog_df, month_start, month_end, service_history=None):
     """
     Project recurring Bath/Groom work into a future month.
     This is planning information only and does not create appointments.
@@ -1896,6 +1964,7 @@ def projected_month_services(dog_df, month_start, month_end):
 
     month_start = pd.Timestamp(month_start).normalize()
     month_end = pd.Timestamp(month_end).normalize()
+    service_history = service_history or {}
     raw = []
 
     for _, row in dog_df.iterrows():
@@ -1910,23 +1979,49 @@ def projected_month_services(dog_df, month_start, month_end):
         groom_weeks = _safe_weeks(row.get("Groom Frequency Weeks"))
 
         if bath_weeks:
-            service_specs.append(("Bath", row.get("Last Bath"), bath_weeks))
+            last_bath = row.get("Last Bath")
+            confirmed_bath = service_history.get(
+                (hid, dog.casefold(), "Bath")
+            )
+            if confirmed_bath is not None:
+                saved_bath = _safe_date(last_bath)
+                if saved_bath is None or confirmed_bath > pd.Timestamp(saved_bath):
+                    last_bath = confirmed_bath
+            service_specs.append(("Bath", last_bath, bath_weeks))
 
         if groom_weeks:
             last_groom = row.get("Last Groom Service")
             if last_groom is None or pd.isna(last_groom):
                 last_groom = row.get("Last Groom")
+
+            confirmed_groom = service_history.get(
+                (hid, dog.casefold(), "Groom")
+            )
+            if confirmed_groom is not None:
+                saved_groom = _safe_date(last_groom)
+                if saved_groom is None or confirmed_groom > pd.Timestamp(saved_groom):
+                    last_groom = confirmed_groom
+
             service_specs.append(("Groom", last_groom, groom_weeks))
 
         # Legacy clients without separate Bath/Groom cadence.
         if not service_specs:
             legacy_weeks = _safe_weeks(row.get("Frequency Weeks"))
             legacy_last = row.get("Last Groom")
+            legacy_service = effective_service_for_dog(
+                row,
+                target_date=month_start,
+            )
+
+            confirmed_legacy = service_history.get(
+                (hid, dog.casefold(), legacy_service)
+            )
+            if confirmed_legacy is not None:
+                saved_legacy = _safe_date(legacy_last)
+                if saved_legacy is None or confirmed_legacy > pd.Timestamp(saved_legacy):
+                    legacy_last = confirmed_legacy
+
             if legacy_weeks and _safe_date(legacy_last) is not None:
-                legacy_service = effective_service_for_dog(
-                    row,
-                    target_date=month_start,
-                )
                 service_specs.append(
                     (legacy_service, legacy_last, legacy_weeks)
                 )
@@ -2817,10 +2912,13 @@ with monthly_tab:
         month_only.get("Minutes", pd.Series(dtype=float)).sum()
     ) if not month_only.empty else 0
 
+    service_history = confirmed_service_history(month_end)
+
     projected = projected_month_services(
         st.session_state.clients,
         month_start,
         month_end,
+        service_history=service_history,
     )
 
     confirmed_hids = set(
@@ -2859,7 +2957,7 @@ with monthly_tab:
     st.caption(
         f"Confirmed groom time: {confirmed_minutes} min · "
         f"Projected unscheduled time: {projected_minutes} min. "
-        "Projections come from each dog's saved recurring Bath/Groom cadence."
+        "Projections use each dog's recurring cadence and restart from the latest confirmed Bath/Groom appointment when one exists."
     )
 
     st.markdown("### Confirmed schedule")
